@@ -1,0 +1,58 @@
+{
+  "POLL_INTERVAL": 1.5,
+  "ACTION_DELAY": 1.0,
+  "STARTUP_DELAY": 3.0,
+  "RUN_TIMEOUT_HOURS": 1.0,
+  "CLOSE_ON_TIMEOUT": true,
+  "SLEEP_PHONE_ON_TIMEOUT": true,
+  "MATCH_THRESHOLD": 0.78,
+  "REF_THRESHOLD": 0.8,
+  "SKILL_DOWNSCALE": 0.5,
+  "SCALE_RANGE": [
+    0.388,
+    0.388,
+    0.05
+  ],
+  "REF_SCALE_RANGE": [
+    0.705,
+    0.705,
+    0.05
+  ],
+  "CLICK_JITTER": 6,
+  "DELAY_JITTER": 0.35,
+  "FIRST_SKILL_SLOT": [
+    839,
+    561
+  ],
+  "SECOND_SKILL_SLOT": [
+    1087,
+    563
+  ],
+  "GAME_OVER_TAP": [
+    964,
+    966
+  ],
+  "BLUESTACKS_REGION": [
+    752,
+    71,
+    417,
+    936
+  ],
+  "SKILL_MATCH_BAND": [
+    416,
+    518
+  ],
+  "ACTIVE_CATEGORIES": [
+    "Sprites",
+    "Attack Speed",
+    "Elemental"
+  ],
+  "CUSTOM_PRIORITY_SKILLS": [],
+  "AVOID_SKILLS": [
+    "Main Weapon/14.png",
+    "Main Weapon/1.png",
+    "Main Weapon/4.png"
+  ],
+  "AUTOSAVE": true,
+  "DARK_MODE": false
+}
