@@ -44,6 +44,15 @@ Open the game and get it on screen first, then start the app:
    and drag them so your favourite/best is on top. Optionally add specific
    must-have skills (*Custom priority*) or skills to never take (*Avoid*).
 
+### Optional: custom buttons
+
+If the game shows extra buttons you want auto-clicked (e.g. an event "Enter"
+button), use **+ Add custom button** on the right. Name the button, then
+drag the box over it on screen and click the green check. The macro will
+click that button on sight, just like the built-in Play / Continue prompts.
+Run **Calibrate scale from screen** first so the capture is saved at the
+right size.
+
 ## Running it
 
 - Make sure the game window is visible and on top.
@@ -54,6 +63,10 @@ Open the game and get it on screen first, then start the app:
 
 ## Other options (top bar)
 
+- **Eternal Lode**: switches the Start button to the Eternal Lode minigame
+  macro (digging the 6x8 board, buying pickaxes when empty, stopping when
+  all resources are gone). Leave it off to play the regular game.
+  **Warning:** this mode is currently untested and may not work properly.
 - **Dark mode**: switch between the dark and light look.
 - **Autosave**: when on, your settings save automatically after every change.
   When off, press **Save settings** to keep changes.
