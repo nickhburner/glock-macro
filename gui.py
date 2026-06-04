@@ -32,6 +32,14 @@ from widgets import (
     RoundedCheckbox, DirectionPad, SegmentToggle,
 )
 
+# Optional pynput for the global Start/Stop hotkey.
+try:
+    from pynput import keyboard as _pynput_kb
+    _PYNPUT_AVAILABLE = True
+except ImportError:
+    _pynput_kb = None
+    _PYNPUT_AVAILABLE = False
+
 # Pillow renamed the resampling enum; support old and new.
 try:
     _RESAMPLE = Image.Resampling.LANCZOS
@@ -357,6 +365,162 @@ def _set_keep_awake(on: bool):
         pass
 
 
+# ------------------------------------------------------------------ Hotkey
+# Global Start/Stop hotkey via pynput.
+
+# Tkinter keysym -> canonical stored key name.
+_KEYSYM_TO_KEY = {
+    'grave': '`', 'asciitilde': '`', 'quoteleft': '`',
+    'space': 'space', 'Return': 'enter', 'BackSpace': 'backspace',
+    'Delete': 'delete', 'Escape': 'esc', 'Tab': 'tab',
+    'minus': '-', 'underscore': '-',
+    'equal': '=', 'plus': '=',
+    'bracketleft': '[', 'braceleft': '[',
+    'bracketright': ']', 'braceright': ']',
+    'backslash': '\\', 'bar': '\\',
+    'semicolon': ';', 'colon': ';',
+    'apostrophe': "'", 'quotedbl': "'",
+    'comma': ',', 'less': ',',
+    'period': '.', 'greater': '.',
+    'slash': '/', 'question': '/',
+}
+for _i in range(1, 13):
+    _KEYSYM_TO_KEY[f'F{_i}'] = f'f{_i}'
+
+# Named keys whose pynput representation is Key.<name>, not a KeyCode.
+_NAMED_KEYS = frozenset(
+    ['space', 'enter', 'tab', 'backspace', 'delete', 'esc']
+    + [f'f{i}' for i in range(1, 13)]
+)
+
+# Display labels for non-obvious stored key names.
+_KEY_DISPLAY = {
+    'space': 'Space', 'enter': 'Enter', 'tab': 'Tab',
+    'backspace': 'Bksp', 'delete': 'Del', 'esc': 'Esc',
+}
+for _i in range(1, 13):
+    _KEY_DISPLAY[f'f{_i}'] = f'F{_i}'
+
+# Character -> Windows virtual-key code (Ctrl masks the char, so
+# the watcher falls back to VK to identify the physical key).
+_CHAR_TO_VK = {
+    '`': 0xC0, '-': 0xBD, '=': 0xBB,
+    '[': 0xDB, ']': 0xDD, '\\': 0xDC,
+    ';': 0xBA, "'": 0xDE, ',': 0xBC,
+    '.': 0xBE, '/': 0xBF,
+}
+for _c in 'abcdefghijklmnopqrstuvwxyz':
+    _CHAR_TO_VK[_c] = ord(_c.upper())
+for _c in '0123456789':
+    _CHAR_TO_VK[_c] = ord(_c)
+
+
+def _hotkey_display(hotkey_str):
+    """Format a stored hotkey for the UI: 'ctrl+`' -> 'Ctrl + `'."""
+    parts = [p.strip() for p in hotkey_str.split('+')]
+    out = []
+    for p in parts:
+        low = p.lower()
+        if low in ('ctrl', 'alt', 'shift'):
+            out.append(low.capitalize())
+        elif low in _KEY_DISPLAY:
+            out.append(_KEY_DISPLAY[low])
+        elif len(low) == 1 and low.isalpha():
+            out.append(low.upper())
+        else:
+            out.append(p)
+    return ' + '.join(out)
+
+
+class _HotkeyWatcher:
+    """Global hotkey listener via pynput.  Fires *on_trigger* (from a
+    background thread) each time the configured combination is pressed."""
+
+    def __init__(self, hotkey_str, on_trigger):
+        self._on_trigger = on_trigger
+        self._listener = None
+        self._held = set()          # currently-held modifier names
+        self._target_mods = set()   # required modifiers
+        self._target_char = None    # main key character (single char keys)
+        self._target_vk = None      # fallback VK code (Windows)
+        self._target_name = None    # pynput Key.name (named keys)
+        self._mod_keys = {}
+        if _PYNPUT_AVAILABLE:
+            self._mod_keys = {
+                _pynput_kb.Key.ctrl_l: 'ctrl',
+                _pynput_kb.Key.ctrl_r: 'ctrl',
+                _pynput_kb.Key.alt_l: 'alt',
+                _pynput_kb.Key.alt_r: 'alt',
+                _pynput_kb.Key.shift_l: 'shift',
+                _pynput_kb.Key.shift_r: 'shift',
+            }
+            for attr in ('ctrl', 'alt', 'shift', 'alt_gr'):
+                k = getattr(_pynput_kb.Key, attr, None)
+                if k is not None and k not in self._mod_keys:
+                    self._mod_keys[k] = attr.split('_')[0]
+        self._parse(hotkey_str)
+
+    def _parse(self, hotkey_str):
+        parts = [p.strip().lower() for p in hotkey_str.split('+')]
+        self._target_mods = set()
+        for p in parts[:-1]:
+            if p in ('ctrl', 'control'):
+                self._target_mods.add('ctrl')
+            elif p == 'alt':
+                self._target_mods.add('alt')
+            elif p == 'shift':
+                self._target_mods.add('shift')
+        key = parts[-1] if parts else ''
+        if key in _NAMED_KEYS:
+            self._target_name = key
+        else:
+            self._target_char = key
+            self._target_vk = _CHAR_TO_VK.get(key)
+
+    def start(self):
+        if not _PYNPUT_AVAILABLE:
+            return
+        self._held = set()
+        self._listener = _pynput_kb.Listener(
+            on_press=self._on_press, on_release=self._on_release,
+            daemon=True)
+        self._listener.start()
+
+    def stop(self):
+        if self._listener is not None:
+            self._listener.stop()
+            self._listener = None
+
+    def _on_press(self, key):
+        mod = self._mod_keys.get(key)
+        if mod:
+            self._held.add(mod)
+            return
+        if self._held != self._target_mods:
+            return
+        # Named key (F1, Space, Enter, ...): match by pynput name.
+        if self._target_name is not None:
+            name = getattr(key, 'name', None)
+            if name is not None and name == self._target_name:
+                self._on_trigger()
+            return
+        # Character key: try the reported char first.
+        ch = getattr(key, 'char', None)
+        if ch is not None and ch.lower() == self._target_char:
+            self._on_trigger()
+            return
+        # Ctrl masks the char on Windows; fall back to virtual-key code.
+        if self._target_vk is not None:
+            vk = getattr(key, 'vk', None)
+            if vk == self._target_vk:
+                self._on_trigger()
+
+    def _on_release(self, key):
+        mod = self._mod_keys.get(key)
+        if mod:
+            self._held.discard(mod)
+
+
 class App:
     def __init__(self, root):
         self.root = root
@@ -454,6 +618,10 @@ class App:
         if config.KEEP_AWAKE:
             _set_keep_awake(True)
 
+        # Global hotkey listener (Start/Stop toggle).
+        self._hotkey_watcher = None
+        self._start_hotkey_watcher()
+
         # First-run: trigger setup wizard when no device is configured.
         if not config.ADB_DEVICE or not any(config.PHONE_RESOLUTION):
             self.root.after(600, self._run_setup_wizard)
@@ -528,6 +696,20 @@ class App:
             activeforeground=self.theme["fg"], padx=6, pady=2)
         self._theme_btn.pack(side="right", padx=(0, 2))
         Tooltip(self._theme_btn, "Toggle dark/light theme")
+
+        self._hotkey_btn = tk.Button(
+            inner, text="Hotkey",
+            command=self._open_hotkey_dialog,
+            font=(ui_font(), 9), relief="flat", cursor="hand2",
+            background=self.theme["surface"],
+            foreground=self.theme["fg_dim"],
+            activebackground=self.theme["surface_2"],
+            activeforeground=self.theme["fg"], padx=6, pady=2)
+        self._hotkey_btn.pack(side="right", padx=(0, 8))
+        self._hotkey_tip = Tooltip(
+            self._hotkey_btn,
+            f"Start / Stop hotkey: {_hotkey_display(config.HOTKEY)}. "
+            f"Click to change.")
 
         self.keep_awake_var = tk.BooleanVar(value=config.KEEP_AWAKE)
         self._keep_awake_cb = RoundedCheckbox(
@@ -1467,7 +1649,7 @@ class App:
                     text_color=p["fg_dim"],
                     canvas_bg=p["surface"])
         for attr in ("_theme_btn", "_settings_btn", "_compact_btn",
-                     "_save_btn"):
+                     "_save_btn", "_hotkey_btn"):
             btn = getattr(self, attr, None)
             if btn is not None:
                 try:
@@ -3006,6 +3188,7 @@ class App:
         out["AUTOSAVE"] = bool(self.autosave_var.get())
         out["DARK_MODE"] = bool(self.dark_var.get())
         out["KEEP_AWAKE"] = bool(self.keep_awake_var.get())
+        out["HOTKEY"] = config.HOTKEY
 
         # Game mode -> config keys
         gm = self._game_mode_id()
@@ -3059,6 +3242,123 @@ class App:
         main.log("keep awake on, PC will not sleep or dim"
                  if on else "keep awake off")
         self._apply_and_save(quiet=True)
+
+    # hotkey
+    def _start_hotkey_watcher(self):
+        """Start (or restart) the global Start/Stop hotkey listener."""
+        if self._hotkey_watcher is not None:
+            self._hotkey_watcher.stop()
+        self._hotkey_watcher = _HotkeyWatcher(
+            config.HOTKEY, self._on_hotkey_pressed)
+        self._hotkey_watcher.start()
+
+    def _on_hotkey_pressed(self):
+        """Fires from the pynput thread; schedule toggle on the UI thread."""
+        try:
+            self.root.after(0, self._toggle_macro)
+        except tk.TclError:
+            pass
+
+    def _toggle_macro(self):
+        """Toggle the macro between running and stopped."""
+        if self._running:
+            self._stop()
+        else:
+            self._start()
+
+    def _open_hotkey_dialog(self):
+        """Open a small dialog to set the global Start/Stop hotkey."""
+        # Pause the watcher while the dialog captures keys.
+        if self._hotkey_watcher is not None:
+            self._hotkey_watcher.stop()
+
+        p = self.theme
+        win = tk.Toplevel(self.root)
+        win.title("Set Hotkey")
+        win.geometry("320x200")
+        win.transient(self.root)
+        win.grab_set()
+        win.resizable(False, False)
+        win.configure(background=p["bg"])
+        set_dark_titlebar(win, self.dark)
+
+        tk.Label(win, text="Set Start / Stop Hotkey",
+                 font=(ui_font(), 11, "bold"),
+                 fg=p["fg"], bg=p["bg"]).pack(pady=(16, 4))
+        tk.Label(win, text="Click here first, then press a new key combination:",
+                 fg=p["fg_dim"], bg=p["bg"],
+                 font=(ui_font(), 9)).pack(pady=(8, 4))
+
+        display_var = tk.StringVar(value=_hotkey_display(config.HOTKEY))
+        tk.Label(win, textvariable=display_var,
+                 font=(ui_font(), 14, "bold"),
+                 fg=p["accent"], bg=p["bg"]).pack(pady=(4, 12))
+
+        captured = [None]
+
+        def on_key(event):
+            mods = []
+            if event.state & 0x4:
+                mods.append('ctrl')
+            if event.state & 0x20000:
+                mods.append('alt')
+            if event.state & 0x1:
+                mods.append('shift')
+            keysym = event.keysym
+            if keysym in ('Control_L', 'Control_R', 'Alt_L', 'Alt_R',
+                          'Shift_L', 'Shift_R'):
+                return
+            if not mods:
+                return
+            key = _KEYSYM_TO_KEY.get(keysym, keysym.lower())
+            combo = '+'.join(mods + [key])
+            captured[0] = combo
+            display_var.set(_hotkey_display(combo))
+
+        win.bind("<KeyPress>", on_key)
+
+        btn_row = tk.Frame(win, bg=p["bg"], highlightthickness=0)
+        btn_row.pack(fill="x", padx=16, pady=(0, 12))
+
+        def _close():
+            self._start_hotkey_watcher()
+            win.destroy()
+
+        def _apply():
+            combo = captured[0] if captured[0] is not None else config.HOTKEY
+            config.HOTKEY = combo
+            self._hotkey_tip.text = (
+                f"Start / Stop hotkey: {_hotkey_display(combo)}. "
+                f"Click to change.")
+            self._start_hotkey_watcher()
+            self._schedule_autosave()
+            main.log(f"hotkey set to {_hotkey_display(combo)}")
+            win.destroy()
+
+        def _reset():
+            captured[0] = "ctrl+`"
+            display_var.set(_hotkey_display("ctrl+`"))
+
+        tk.Button(btn_row, text="Reset", command=_reset,
+                  font=(ui_font(), 9), relief="flat", cursor="hand2",
+                  bg=p["surface_2"], fg=p["fg_dim"],
+                  activebackground=p["surface_3"],
+                  activeforeground=p["fg"], padx=8, pady=4).pack(side="left")
+
+        tk.Button(btn_row, text="Cancel", command=_close,
+                  font=(ui_font(), 9), relief="flat", cursor="hand2",
+                  bg=p["surface_2"], fg=p["fg_dim"],
+                  activebackground=p["surface_3"],
+                  activeforeground=p["fg"], padx=8, pady=4).pack(side="right")
+
+        tk.Button(btn_row, text="Apply", command=_apply,
+                  font=(ui_font(), 9), relief="flat", cursor="hand2",
+                  bg=p["accent"], fg="#ffffff",
+                  activebackground=p["accent"],
+                  activeforeground="#ffffff", padx=8, pady=4).pack(
+                      side="right", padx=(0, 6))
+
+        win.protocol("WM_DELETE_WINDOW", _close)
 
     def _wire_autosave_traces(self):
         for var in self.vars.values():
@@ -3444,6 +3744,8 @@ class App:
             self._stop_event.set()
         _set_keep_awake(False)
         self._stop_capture_stream()
+        if self._hotkey_watcher is not None:
+            self._hotkey_watcher.stop()
         main.set_log_sink(None)
         self.root.destroy()
 

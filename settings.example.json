@@ -29,6 +29,7 @@
   "AUTOSAVE": true,
   "DARK_MODE": true,
   "KEEP_AWAKE": false,
+  "HOTKEY": "ctrl+`",
   "ETERNAL_LODE_MODE": false,
   "GAME_MODE": "chapter",
   "MOVEMENT_MODE": 0,
