@@ -110,7 +110,7 @@ SKILL_CATEGORIES = [
     "Other",
 ]
 
-ACTIVE_CATEGORIES      = list(SKILL_CATEGORIES)
+ACTIVE_CATEGORIES      = ["Sprites", "Attack Speed", "Elemental"]
 CUSTOM_PRIORITY_SKILLS = []
 AVOID_SKILLS           = []
 
@@ -269,7 +269,7 @@ REF_START_CHALLENGE = REF_DIR / "start_challenge.png"
 USE_STREAM_CAPTURE = True
 
 # ------------------------------------------------------------------ GUI
-AUTOSAVE   = False
+AUTOSAVE   = True
 DARK_MODE  = True
 KEEP_AWAKE = False
 
