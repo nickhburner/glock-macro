@@ -1,4 +1,5 @@
-pyautogui
 opencv-python
 numpy
 Pillow
+pynput
+av

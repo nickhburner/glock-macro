@@ -6,54 +6,45 @@
   "CLOSE_ON_TIMEOUT": false,
   "SLEEP_PHONE_ON_TIMEOUT": false,
   "MATCH_THRESHOLD": 0.78,
-  "REF_THRESHOLD": 0.8,
-  "SKILL_DOWNSCALE": 0.4,
-  "SCALE_RANGE": [
-    0.529,
-    0.529,
-    0.05
-  ],
-  "REF_SCALE_RANGE": [
-    0.962,
-    0.962,
-    0.05
-  ],
-  "CLICK_JITTER": 7,
+  "REF_THRESHOLD": 0.80,
+  "SKILL_DOWNSCALE": 0.5,
+  "REF_DOWNSCALE": 0.6,
+  "CALIBRATED_SCALE": 1.0,
+  "ADB_DEVICE": "",
+  "PHONE_RESOLUTION": [0, 0],
+  "CLICK_JITTER": 6,
   "DELAY_JITTER": 0.35,
-  "FIRST_SKILL_SLOT": [
-    817,
-    540
-  ],
-  "SECOND_SKILL_SLOT": [
-    1095,
-    542
-  ],
-  "GAME_OVER_TAP": [
-    967,
-    988
-  ],
-  "BLUESTACKS_REGION": [
-    659,
-    1,
-    603,
-    1078
-  ],
-  "SKILL_MATCH_BAND": [
-    413,
-    563
-  ],
+  "FIRST_SKILL_SLOT": [97, 432],
+  "SECOND_SKILL_SLOT": [270, 432],
+  "GAME_OVER_TAP": [270, 403],
+  "SKILL_MATCH_BAND": [307, 576],
   "ACTIVE_CATEGORIES": [
     "Sprites",
+    "Main Weapon",
+    "Circles",
     "Attack Speed",
-    "Elemental"
+    "Attack Power",
+    "Strikes",
+    "Elemental",
+    "Plants",
+    "HP",
+    "Meteor",
+    "Potions",
+    "Other"
   ],
   "CUSTOM_PRIORITY_SKILLS": [],
-  "AVOID_SKILLS": [
-    "Main Weapon/14.png",
-    "Main Weapon/1.png",
-    "Main Weapon/4.png"
-  ],
-  "AUTOSAVE": true,
+  "AVOID_SKILLS": [],
+  "USE_STREAM_CAPTURE": true,
+  "AUTOSAVE": false,
   "DARK_MODE": true,
-  "ETERNAL_LODE_MODE": false
+  "ETERNAL_LODE_MODE": false,
+  "GAME_MODE": "chapter",
+  "MOVEMENT_MODE": 0,
+  "MOVEMENT_CHAPTER": [90.0, 0.1, 0.0, 0.0],
+  "MOVEMENT_PLANT_PRESET": "top",
+  "MOVEMENT_PLANT_T": 0.5,
+  "MOVEMENT_CUSTOM": [0.0, 1.0, 0.0, 1.0],
+  "MOVEMENT_JOYSTICK_X_RATIO": 0.50,
+  "MOVEMENT_JOYSTICK_Y_RATIO": 0.90,
+  "MOVEMENT_SWIPE_LEN_RATIO": 0.10
 }

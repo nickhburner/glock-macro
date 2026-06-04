@@ -1,83 +1,99 @@
 # A2 Macro Controller
 
-A *helper* that plays the skill-picking parts of the game for you. It watches
-the game window, chooses skills based on what you tell it to prefer, and taps
-through the menus on its own.
+An automation tool for an Archero-style mobile game. It watches the game screen
+via ADB, identifies UI states and skill choices using template matching, and
+taps the optimal option automatically. Works with **BlueStacks**, other Android
+emulators, or a **real Android phone** over USB.
 
-## What you need
+## Prerequisites
 
-- A Windows 10 or 11 PC.
-- The game running in one of:
-  - **BlueStacks** (an Android emulator), or
-  - your real phone, mirrored to the PC with **scrcpy** *(it probably works
-    with other emulators, but this is what I tested it with)*.
-- Keep this folder together. `A2 Macro Controller.exe` needs the `skills` and
-  `ref` folders sitting right next to it. Put the whole folder somewhere you
-  can edit, like your Desktop, **not** inside `Program Files`.
+- **Windows 10 or 11.**
+- **ADB (Android Debug Bridge) enabled on your device:**
+  - **BlueStacks:** Settings > Advanced > toggle "Android Debug Bridge (ADB)" on.
+  - **Real phone:** Settings > Developer Options > enable "USB Debugging", then
+    connect via USB cable. (Developer Options is unlocked by tapping Build Number
+    7 times in Settings > About Phone.)
+- Keep this folder together. `A2 Macro Controller.exe` needs the `skills/` and
+  `ref/` folders sitting right next to it. Put the whole folder somewhere you
+  can edit (e.g. Desktop), **not** inside `Program Files`.
 
-**Downloads**
+## First-time setup
 
-- scrcpy (easiest with Android + ADB enabled): <https://scrcpy.org/>
-- BlueStacks (no phone needed): <https://www.bluestacks.com/>
+1. **Open the game** on BlueStacks or your phone, then launch `A2 Macro Controller.exe`.
+2. **Connect your device.** The app auto-detects available ADB devices. Pick
+   yours from the dropdown and click **Test Connection**. If no devices appear,
+   hit **Refresh**.
+3. **Run the Setup Wizard.** It connects to the device, reads the screen
+   resolution, and writes all click-target coordinates automatically. No manual
+   region picking or scale calibration needed.
+4. **Choose your skills.** Tick the skill categories you want on the left and
+   drag them so your favourite is on top. Optionally add specific must-have
+   skills (Custom Priority) or skills to never take (Avoid).
 
-## First-time setup (about 2 minutes)
+That is it. Press **Start**.
 
-Open the game and get it on screen first, then start the app:
+## Features
 
-1. **Double-click `A2 Macro Controller.exe`.**
-2. **Tell it where the game is.** Click **Pick** next to *Capture region*,
-   then click anywhere on your game window. A box appears over it; drag the
-   edges in until the box covers just the game screen (no black bars or
-   toolbars). Click the green check to save.
-3. **Line up the matching.** Get to a skill-selection screen in the game,
-   then click **Calibrate scale from screen**. Wait for the countdown. This
-   sizes the image matching to your window. Do this again any time you resize
-   the game window or switch between BlueStacks and scrcpy.
-4. **Set the tap spots.** Use the **Pick** buttons for *First skill slot*,
-   *Second skill slot* and *Game-over tap*; each pops a bullseye you drag
-   onto the right spot, then click the green check.
-   > **Tip:** Set this up in a Valkyrie skill selection. Place the first
-   > tap-spot/bullseye on the **left edge of the first skill**, and the second
-   > on the **right edge of the second skill**. This makes sure the macro can
-   > click skills in both regular and Valkyrie skill selections.
-5. **Choose what to grab.** Tick the skill categories you want on the left,
-   and drag them so your favourite/best is on top. Optionally add specific
-   must-have skills (*Custom priority*) or skills to never take (*Avoid*).
-
-### Optional: custom buttons
-
-If the game shows extra buttons you want auto-clicked (e.g. an event "Enter"
-button), use **+ Add custom button** on the right. Name the button, then
-drag the box over it on screen and click the green check. The macro will
-click that button on sight, just like the built-in Play / Continue prompts.
-Run **Calibrate scale from screen** first so the capture is saved at the
-right size.
+- **Fully ADB-based.** No screen region picking, no window focus required. The
+  game window does not need to be visible or on top.
+- **Automatic device setup.** The Setup Wizard detects resolution and computes
+  all coordinates; no manual calibration.
+- **Smart skill selection.** Prioritise skill categories by drag order, pin
+  specific must-have skills (Custom Priority), and blacklist skills to never
+  take (Avoid list). Rerolls automatically when no wanted skill is showing.
+- **Multiple game modes:** Chapter, Plant Defense, Shackled Jungle, and Eternal
+  Lode, each with mode-specific options.
+- **Automatic movement.** Configurable per-mode joystick movement after the
+  first skill selection: timed chapter run, or directional Plant Defense
+  positioning (top/bottom/left/right, with automatic spawn-side detection).
+- **Speed control.** Automatically cycles the in-game speed to max (3x) at the
+  start of each match.
+- **Tap-on-sight buttons.** Built-in detection for Play, Continue, Get Ready,
+  Start Challenge, Devil Reject, Game Over, challenge-ended screens, spin wheel,
+  and more. Clicked automatically whenever seen.
+- **Custom buttons.** Capture any extra on-screen button (e.g. an event banner)
+  via ADB screenshot crop; the macro clicks it on sight.
+- **Streaming capture.** Frames come from a continuous `screenrecord` H.264
+  stream (decoded with PyAV), not per-poll screenshots. Faster and avoids
+  BlueStacks black-frame issues.
+- **Eternal Lode mode.** Automates the mining minigame: reads the board, clicks
+  optimal cells, buys pickaxes, uses tools, opens chests.
+- **Run timeout.** Automatically stop after a set duration; optionally close the
+  game window and/or sleep the phone.
+- **Humanised input.** Tap jitter and timing randomisation.
+- **Dark / light theme.**
+- **Autosave.** Settings persist to `settings.json` automatically or on demand.
+- **Global Esc failsafe.** Press Esc at any time (any window focused) to
+  instantly stop the macro.
+- **Standalone .exe.** No Python install needed for end users.
 
 ## Running it
 
-- Make sure the game window is visible and on top.
-- Press **Start**. The status in the top-right turns green (**Running**).
-- To stop: press **Stop**, press **Esc**, or slam your mouse into any corner
-  of the screen *(inconsistent, but maybe useful if it somehow goes
-  haywire)*. The status turns red (**Stopped**).
-
-## Other options (top bar)
-
-- **Eternal Lode**: switches the Start button to the Eternal Lode minigame
-  macro (digging the 6x8 board, buying pickaxes when empty, stopping when
-  all resources are gone). Leave it off to play the regular game.
-  **Warning:** this mode is currently untested and may not work properly.
-- **Dark mode**: switch between the dark and light look.
-- **Autosave**: when on, your settings save automatically after every change.
-  When off, press **Save settings** to keep changes.
-- **Lock window**: pins the app on top and stops it being moved or resized.
+- Press **Start**. The status pill turns green (**Running**).
+- To stop: press **Stop**, or press **Esc** anywhere on your PC.
+- Your setup is remembered in `settings.json` next to the `.exe`.
 
 ## Good to know
 
-- Your setup is remembered in `settings.json` next to the `.exe`.
 - The first launch can take a few seconds (the `.exe` unpacks itself).
 - If Windows SmartScreen warns about an unknown publisher, click
   **More info**, then **Run anyway**.
-- **Seeing a black capture?** In BlueStacks set the graphics renderer to
-  OpenGL; on scrcpy make sure the mirror window is visible and the phone
-  screen is on. Also make sure the screen region is properly chosen.
+- **Seeing a black capture?** In BlueStacks, set the graphics renderer to
+  OpenGL. On a real phone, make sure the screen is on. Stream capture
+  (on by default) usually prevents this.
+
+## Running from source
+
+```
+pip install -r requirements.txt
+python gui.py
+```
+
+To build the standalone `.exe`:
+
+```
+build.bat
+```
+
+The output goes to `dist/`. Copy `skills/`, `ref/`, and `README.md` alongside
+the `.exe` (the build script does this automatically).

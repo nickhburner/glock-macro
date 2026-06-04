@@ -1,57 +1,88 @@
 """
 A2 Macro Controller: main loop.
 
-Watches the game window (BlueStacks or a scrcpy phone mirror), identifies the
-current state via template matching
+Watches the game via ADB screenshots, identifies the current state via
+template matching, and taps the correct UI element.
 
 Usage:
-    python main.py        # head-less with saved settings
+    python main.py        # headless with saved settings
     python gui.py         # graphical control panel
 """
 
+import math
 import random
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
+from typing import Optional
 
-import pyautogui
-
+import capture
 import config
+from adb import ADBClient, ADBError, BlackFrameError
 from matcher import (
     crop_band,
-    grab_screen_bgr,
     is_blank,
     list_skill_files,
     load_template,
-    make_scales,
     multi_scale_match,
+    resize_to_width,
     skill_hash,
 )
 
-pyautogui.FAILSAFE = True   # mouse to a screen corner aborts
-pyautogui.PAUSE = 0.05
-
-# Keeps the subprocess helpers (taskkill, tasklist, powershell, adb) from
-# flashing a console window in PyInstaller's --windowed build. 0 where absent.
+# Keeps subprocess helpers from flashing a console window in --windowed builds.
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
+# Optional pynput for the global Esc failsafe.
+try:
+    from pynput import keyboard as _pynput_kb
+    _PYNPUT_AVAILABLE = True
+except ImportError:
+    _pynput_kb = None
+    _PYNPUT_AVAILABLE = False
 
-# logging
-# Optional sink that mirrors every log line elsewhere (the GUI shows it).
+# Module-level reference to the active ADB client.  Set by run_macro() /
+# run_eternal_lode() so sleep_phone() (imported by eternal_lode.py) works.
+_active_adb: Optional[ADBClient] = None
+
+# Buttons that begin a gamemode: the FIRST skill selection after one of these is
+# the cue to run the set movement (matched by name prefix, so variants like
+# start-hard-chapter-2 also count).  glory/level can be unreliable on entry, so
+# we key off the start button instead of the banner type.  (start_challenge +
+# get-ready begin Plant Defense; start-chapter/start-hard-chapter the chapters.)
+MOVEMENT_START_BUTTONS = (
+    "ad-start", "get-ready", "play_button",
+    "start-hard-chapter", "start-chapter",
+    "start_challenge", "start-challenge",
+)
+
+# Plant Defense spawn is determined by HOW the match was entered, not by image
+# detection: the host starts the match (start_challenge) and always spawns in
+# position 1 (left); a guest joins and enters via get-ready, spawning in
+# position 2 (right).  Maps a start-button name prefix -> spawn; _maybe_arm_
+# movement records it so _do_movement can pick the matching path.
+PLANT_SPAWN_BY_START = (
+    ("start_challenge", 1), ("start-challenge", 1),
+    ("get-ready", 2),
+)
+
+
+# ------------------------------------------------------------------
+# Logging
+# ------------------------------------------------------------------
+
 _log_sink = None
 
 
 def set_log_sink(sink):
-    """Install a callable that receives every formatted log line, or None."""
+    """Install a callable that receives every log line, or None to remove."""
     global _log_sink
     _log_sink = sink
 
 
 def log(msg):
     line = f"[{time.strftime('%H:%M:%S')}] {msg}"
-    # A --windowed build has no console (sys.stdout is None), so guard print;
-    # the GUI sink still shows the line.
     if sys.stdout is not None:
         try:
             print(line, flush=True)
@@ -61,38 +92,60 @@ def log(msg):
         try:
             _log_sink(line)
         except Exception:
-            pass   # a broken sink must never kill the macro
+            pass
 
 
-def click(x, y, label):
-    """Move to (x, y) and click, with a few px of jitter and randomised
-    timing so input is neither pixel-perfect nor perfectly periodic."""
-    jx = x + random.randint(-config.CLICK_JITTER, config.CLICK_JITTER)
-    jy = y + random.randint(-config.CLICK_JITTER, config.CLICK_JITTER)
-    log(f"  click {label} @ ({jx}, {jy})")
-    pyautogui.moveTo(jx, jy, duration=random.uniform(*config.MOVE_DURATION_RANGE))
-    time.sleep(random.uniform(*config.CLICK_DELAY_RANGE))
-    pyautogui.click()
-
+# ------------------------------------------------------------------
+# Timing helpers
+# ------------------------------------------------------------------
 
 def rand_delay(base):
-    """`base` seconds randomised by +/- config.DELAY_JITTER fraction."""
+    """`base` seconds varied by +/- config.DELAY_JITTER fraction."""
     return base * random.uniform(1.0 - config.DELAY_JITTER,
                                  1.0 + config.DELAY_JITTER)
 
 
 def _interruptible_sleep(seconds, stop_event):
-    """Sleep `seconds`, waking immediately if `stop_event` is set."""
+    """Sleep `seconds`, returning early if `stop_event` is set."""
     if stop_event is not None:
         stop_event.wait(seconds)
     else:
         time.sleep(seconds)
 
 
+# ------------------------------------------------------------------
+# Failsafe
+# ------------------------------------------------------------------
+
+def _start_failsafe_listener(stop_event):
+    """Spawn a daemon pynput listener that sets stop_event on global Esc.
+
+    Returns the listener (or None if pynput is unavailable).  The macro loop
+    still checks stop_event each iteration, so the listener just sets the
+    event; the loop performs the clean shutdown.
+    """
+    if not _PYNPUT_AVAILABLE:
+        log("pynput not installed -- global Esc failsafe unavailable. "
+            "Use the Stop button or Ctrl+C to stop the macro.")
+        return None
+
+    def on_press(key):
+        if key == _pynput_kb.Key.esc:
+            log("fail-safe: Esc pressed globally, stopping")
+            stop_event.set()
+            return False  # stop listener
+
+    listener = _pynput_kb.Listener(on_press=on_press, daemon=True)
+    listener.start()
+    return listener
+
+
+# ------------------------------------------------------------------
+# Process / window management
+# ------------------------------------------------------------------
+
 def close_target():
-    """Force-close the game-window processes in config.CLOSE_PROCESSES via
-    taskkill. The list covers both backends, so a process not running is just
-    reported and skipped."""
+    """Force-close game-window processes (both backends) via taskkill."""
     for name in config.CLOSE_PROCESSES:
         result = subprocess.run(
             ["taskkill", "/F", "/IM", name],
@@ -101,15 +154,11 @@ def close_target():
         if result.returncode == 0:
             log(f"  closed {name}")
         else:
-            log(f"  {name} not running")   # taskkill non-zero = not running
+            log(f"  {name} not running")
 
-
-# phone power (scrcpy)
-# Killing scrcpy.exe leaves the mirrored phone awake on the game (overheating),
-# so these reach the phone over adb to turn its screen off on timeout.
 
 def _is_running(image_name):
-    """True if a process with this .exe image name is running."""
+    """True if a process with this .exe image name is currently running."""
     try:
         result = subprocess.run(
             ["tasklist", "/FI", f"IMAGENAME eq {image_name}", "/NH"],
@@ -121,115 +170,145 @@ def _is_running(image_name):
     return image_name.lower() in result.stdout.lower()
 
 
-def _running_process_dir(image_name):
-    """Folder of a running process by .exe image name, or None."""
-    stem = image_name[:-4] if image_name.lower().endswith(".exe") else image_name
-    try:
-        result = subprocess.run(
-            ["powershell", "-NoProfile", "-Command",
-             f"(Get-Process -Name '{stem}' -ErrorAction SilentlyContinue "
-             f"| Select-Object -First 1).Path"],
-            capture_output=True, text=True, timeout=15,
-            creationflags=_NO_WINDOW,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    path = result.stdout.strip()
-    if path and Path(path).exists():
-        return Path(path).parent
-    return None
-
-
-def _find_adb():
-    """Locate adb: prefer the adb.exe bundled next to a running scrcpy.exe,
-    then fall back to config.ADB_PATH (default "adb" on PATH)."""
-    scrcpy_dir = _running_process_dir("scrcpy.exe")
-    if scrcpy_dir is not None:
-        adb = scrcpy_dir / "adb.exe"
-        if adb.exists():
-            return str(adb)
-    return config.ADB_PATH
-
-
 def sleep_phone():
-    """Turn the scrcpy-connected phone's screen off via adb (KEYCODE_SLEEP).
-    Failures are logged, never raised."""
-    adb = _find_adb()
-    log("  phone: turning the screen off via adb (KEYCODE_SLEEP)")
-    try:
-        result = subprocess.run(
-            [adb, "shell", "input", "keyevent", "223"],  # 223 = KEYCODE_SLEEP
-            capture_output=True, text=True, timeout=20,
-            creationflags=_NO_WINDOW,
-        )
-    except FileNotFoundError:
-        log(f"  phone: adb not found ('{adb}'), add scrcpy's folder to "
-            f"PATH, or set ADB_PATH in config.py")
-        return
-    except (OSError, subprocess.SubprocessError) as e:
-        log(f"  phone: adb call failed, {e!r}")
-        return
-    if result.returncode == 0:
-        log("  phone: screen off")
-    else:
-        err = (result.stderr or result.stdout or "").strip()
-        log(f"  phone: adb could not sleep the device, {err or 'unknown'}")
+    """Turn the phone screen off via ADB (delegates to the active client).
 
+    Imported by eternal_lode.py for its own timeout handler.  Non-fatal.
+    """
+    if _active_adb is not None:
+        _active_adb.sleep_phone()
+    else:
+        log("  phone: ADB client not initialised, cannot sleep phone")
+
+
+# ------------------------------------------------------------------
+# Macro class
+# ------------------------------------------------------------------
 
 class Macro:
-    def __init__(self):
-        self.skill_scales = make_scales(config.SCALE_RANGE)
-        self.ref_scales = make_scales(config.REF_SCALE_RANGE)
+    def __init__(self, adb_client: ADBClient, stream=None):
+        self.adb = adb_client
+        # Optional capture.ScreenRecordStream; when present, frames come from it
+        # (fast, keeps the surface composited). No screencap fallback.
+        self._stream = stream
+        # Match across a small scale range (not one value) so a slightly-off
+        # CALIBRATED_SCALE still finds icons -- this is what makes detection
+        # robust on devices that don't render at exactly the template baseline.
+        self.skill_scales = config.skill_scales()
+        self.ref_scales   = config.ref_scales()
+        log(f"skill scales {[round(s, 3) for s in self.skill_scales]}  "
+            f"ref scales {[round(s, 3) for s in self.ref_scales]}")
 
-        # Required UI refs.
+        # Every frame is normalised to this width before matching; _norm is the
+        # per-frame scale (MATCH_WIDTH / device_width) used to convert matched
+        # coords back to real device pixels for tapping.  See config.MATCH_WIDTH.
+        self.match_width = config.MATCH_WIDTH
+        self._norm = 1.0
+
+        # Per-ref match zone (ref-relative path -> "top"/"middle"/"bottom"),
+        # so each ref is searched in only ~half the frame. Default "full".
+        self._zones = config.load_ref_zones()
+        self._ref_zone = {}
+
+        # refresh (reroll) + skill-screen banners go through self.refs/_find_ref,
+        # since the skill-selection flow needs them by name. All other refs are
+        # loaded as behavior GROUPS below (missing files are skipped, so you can
+        # add them incrementally with the GUI "Capture ref" tool).
         self.refs = {}
-        for key, path in (("devil", config.REF_DEVIL),
-                          ("game_over", config.REF_GAME_OVER),
-                          ("play", config.REF_PLAY),
-                          ("get_ready", config.REF_GET_READY),
-                          ("continue", config.REF_CONTINUE),
-                          ("start_challenge", config.REF_START_CHALLENGE),
-                          ("refresh", config.REF_REFRESH)):
-            self.refs[key] = load_template(path)
-
-        # Skill-screen banners, any one detects the screen. Optional: a banner
-        # not captured yet is skipped.
         self.skill_banners = []
-        for key, path in (("valkyrie", config.REF_VALKYRIE),
-                          ("level", config.REF_LEVEL),
-                          ("glory", config.REF_GLORY)):
+        for key, path in (("refresh",  config.REF_REFRESH),
+                          ("valkyrie", config.REF_VALKYRIE),
+                          ("level",    config.REF_LEVEL),
+                          ("glory",    config.REF_GLORY),
+                          ("angel",    config.REF_ANGEL)):
             if path.exists():
                 self.refs[key] = load_template(path)
-                self.skill_banners.append(key)
+                self._ref_zone[key] = self._zones.get(path.name, "full")
+                if key != "refresh":
+                    self.skill_banners.append(key)
+            elif key == "refresh":
+                log("NOTE: refresh.png not captured; cannot reroll skills")
             else:
                 log(f"NOTE: skill banner '{path.name}' not captured yet, skipping")
         if not self.skill_banners:
             log("WARNING: no skill-screen banners available, "
                 "skill selection will not be detected")
 
-        # Custom press-it buttons (user-captured in ref/custom/), clicked on
-        # sight like the built-in buttons.
-        self.custom_refs = []   # [(name, template), ...]
+        # Tap-on-sight buttons: clicked whenever seen. Names map to ref/<name>.png
+        # (a trailing * globs variants, e.g. start-hard-chapter, -2, ...).
+        self.tap_buttons = self._load_group(
+            "devil_reject", "play_button", "continue", "get-ready",
+            "start_challenge", "ad-start", "ready-hard-chapter",
+            "start-chapter", "start-hard-chapter*")
+
+        # Speed button (cycles 1x -> 2x -> 3x). Driven to max speed each match.
+        self.speed_refs = {}
+        for spd, nm in (("1x", "1x-speed"), ("2x", "2x-speed"), ("3x", "3x-speed")):
+            g = self._load_group(nm)
+            if g:
+                self.speed_refs[spd] = g[0]          # (name, tpl, zone)
+
+        # Challenge-ended screens (replace the old game-over/tap-to-close):
+        # wait, then tap near the bottom centre to dismiss.
+        # Exception: challenge-has-ended3 uses a Continue button -- load it
+        # separately so it gets the tap_buttons / all-refs scan instead.
+        self.challenge_ended_continue = self._load_group("challenge-has-ended3")
+        # All tap-to-dismiss end screens EXCEPT the '3' continue-button variant.
+        # The base "challenge-has-ended.png" must be listed explicitly: the glob
+        # "challenge-has-ended[!3]*" can't match it (the [!3] class consumes the
+        # dot, leaving nothing for the trailing .png), so it only catches the
+        # numbered variants (challenge-has-ended2, -4, ...).
+        self.challenge_ended = self._load_group(
+            "challenge-has-ended", "challenge-has-ended[!3]*")
+        # The Continue button shown on the challenge-has-ended3 end screen.  The
+        # end banner stays on screen alongside this button, so step() must find
+        # and tap it within the challenge-ended branch rather than deferring to
+        # the tap_buttons scan (which that branch's early return never reaches).
+        self.continue_button = self._load_group("continue")
+        # Wheel spin: the spin button, and the "you won a skill" reward popup.
+        self.spin_wheel   = self._load_group("spin-wheel")
+        self.wheel_reward = self._load_group("wheel-reward")
+
+        # Custom "press it when you see it" buttons (ref/custom/).
+        self.custom_refs = []
         for path in sorted(config.REF_CUSTOM_DIR.glob("*.png")):
             try:
-                self.custom_refs.append((path.stem, load_template(path)))
+                zone = self._zones.get(f"custom/{path.name}", "full")
+                self.custom_refs.append((path.stem, load_template(path), zone))
             except (FileNotFoundError, ValueError):
-                log(f"NOTE: custom button '{path.name}' could not be loaded"
-                    f", skipping")
+                log(f"NOTE: custom button '{path.name}' could not be loaded, skipping")
         if self.custom_refs:
             log(f"loaded {len(self.custom_refs)} custom button(s): "
-                + ", ".join(n for n, _ in self.custom_refs))
+                + ", ".join(n for n, *_ in self.custom_refs))
+        log(f"behaviors: {len(self.tap_buttons)} tap-button(s), "
+            f"{len(self.speed_refs)} speed, {len(self.challenge_ended)} "
+            f"challenge-end, {len(self.spin_wheel)+len(self.wheel_reward)} wheel")
 
-        # Priority skills grouped by active category, checked in
-        # ACTIVE_CATEGORIES order, best-to-worst within each. Avoided skills
-        # (matched by content hash, so all copies count) are excluded here.
+        # Speed-control state (see _adjust_speed): track last seen speed and
+        # whether 3x turned out to be unavailable (so we hold at 2x, no oscillation).
+        self._last_speed = None
+        self._speed_max_2x = False
+
+        # Movement sequence (see step()): a start button (only when a movement
+        # mode is selected) arms it; when the FIRST skill selection's banner
+        # disappears, run the movement in gameplay (force 1x first if the mode
+        # has a speed button), then let speed return to max. _adjust_speed is
+        # suppressed while armed so the forced 1x holds until the move is done.
+        self._move_armed = False
+        self._move_in_skill = False
+        self._move_action = None        # None / "move"
+        # Plant Defense spawn (1=host/left, 2=guest/right), set from the start
+        # button in _maybe_arm_movement and consumed by _do_movement.
+        self._plant_spawn = 1
+
+        # Active skill categories with avoid filtering.
         avoid_hashes = set()
         for ident in config.AVOID_SKILLS:
             h = skill_hash(config.SKILLS_DIR / ident)
             if h is not None:
                 avoid_hashes.add(h)
 
-        self.skill_categories = []   # [(category, [(name, template), ...]), ...]
+        self.skill_categories = []
         total = 0
         excluded = []
         for category in config.ACTIVE_CATEGORIES:
@@ -253,59 +332,183 @@ class Macro:
         log(f"loaded {len(self.refs)} UI refs and {total} skill icons "
             f"across {len(self.skill_categories)} active categories")
         if excluded:
-            log(f"avoid list excludes {len(excluded)} skill file(s) from "
-                f"priority picks: {', '.join(excluded)}")
+            log(f"avoid list excludes {len(excluded)} skill file(s): "
+                + ", ".join(excluded))
         if total == 0:
-            log("WARNING: no skill icons found, the macro will always fall "
-                "back to the first skill slot")
+            log("WARNING: no skill icons found, macro will always fall back "
+                "to the first skill slot")
 
-        # Custom priority skills, picked above ALL categories in added order.
-        # Avoided skills are excluded (the avoid list still wins).
-        self.custom_priority = []   # [(identifier, template), ...]
+        # Custom priority skills (picked above all categories).
+        self.custom_priority = []
         for ident in config.CUSTOM_PRIORITY_SKILLS:
             path = config.SKILLS_DIR / ident
             if not path.exists():
-                log(f"NOTE: custom priority skill '{ident}' image not found"
-                    f", skipping")
+                log(f"NOTE: custom priority skill '{ident}' not found, skipping")
                 continue
             if avoid_hashes and skill_hash(path) in avoid_hashes:
-                log(f"NOTE: custom priority skill '{ident}' is also on the "
-                    f"avoid list, the avoid list wins, skipping")
+                log(f"NOTE: custom priority skill '{ident}' is on the avoid "
+                    f"list; avoid wins, skipping")
                 continue
             self.custom_priority.append((ident, load_template(path)))
         if self.custom_priority:
             log(f"loaded {len(self.custom_priority)} custom priority skill(s)")
 
-        # Avoid skills, matched against the first slot before the fallback.
-        self.avoid_skills = []   # [(identifier, template), ...]
+        # Avoid skills checked against the first slot before the fallback.
+        self.avoid_skills = []
         for ident in config.AVOID_SKILLS:
             path = config.SKILLS_DIR / ident
             if path.exists():
                 self.avoid_skills.append((ident, load_template(path)))
             else:
-                log(f"NOTE: avoid skill '{ident}' image not found, skipping")
+                log(f"NOTE: avoid skill '{ident}' not found, skipping")
         if self.avoid_skills:
             log(f"loaded {len(self.avoid_skills)} avoid skill(s)")
 
         self._warn_blank_refs()
 
     def _warn_blank_refs(self):
-        """Flag reference images that look like blank/placeholder captures."""
         blank = [name for name, tpl in self.refs.items() if is_blank(tpl)]
         if blank:
             log("WARNING: these ref images look blank and will never match: "
                 + ", ".join(blank))
-            log("         re-capture them (see SETUP.md step 5 / run diagnose.py)")
+            log("         re-capture them (run diagnose.py)")
 
-    # detection
-    def _find_ref(self, image, key):
-        conf, center, _ = multi_scale_match(image, self.refs[key], self.ref_scales)
+    # ------------------------------------------------------------------
+    # Input
+    # ------------------------------------------------------------------
+
+    def _tap(self, x, y, label):
+        """Send a tap.  (x, y) are in the normalised match space (MATCH_WIDTH);
+        convert to real device pixels via _norm, then add jitter + a pre-delay."""
+        dx = round(x / self._norm)
+        dy = round(y / self._norm)
+        jx = dx + random.randint(-config.CLICK_JITTER, config.CLICK_JITTER)
+        jy = dy + random.randint(-config.CLICK_JITTER, config.CLICK_JITTER)
+        log(f"  tap {label} @ ({jx}, {jy})")
+        time.sleep(random.uniform(*config.CLICK_DELAY_RANGE))
+        self.adb.tap(jx, jy)
+
+    # ------------------------------------------------------------------
+    # Capture
+    # ------------------------------------------------------------------
+
+    def _grab(self):
+        """Current frame. With a stream attached (streaming mode) read the
+        latest decoded frame, effectively free. We NEVER fall back to
+        screencap mid-run. A brief stall (the ~1s gap between screenrecord
+        segments) is bridged by the last frame while it is still fresh; a
+        longer stall triggers a full ADB reconnect + stream re-establish
+        before giving up. Without a stream (USE_STREAM_CAPTURE off) capture
+        is a deliberate screencap."""
+        if self._stream is None:
+            return self.adb.screenshot()
+        frame = self._stream.latest(max_age=3.0)
+        if frame is not None:
+            return frame
+        # No fresh frame for >3s: give the stream a moment to recover (it
+        # auto-relaunches each segment) before escalating.
+        frame = self._wait_for_stream_frame(timeout=3.0)
+        if frame is not None:
+            return frame
+        # Stream is dead. Attempt a full ADB reconnect + stream rebuild.
+        frame = self._recover_stream()
+        if frame is not None:
+            return frame
+        raise ADBError(
+            "capture stream lost and recovery failed. Check the device "
+            "screen is on and the USB/ADB connection is stable.")
+
+    def _wait_for_stream_frame(self, timeout=3.0):
+        """After a >max_age stall, poll briefly for the stream to recover (the
+        decode thread relaunches screenrecord each segment / on error). Returns
+        a fresh frame, or None if none arrives within `timeout`."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            frame = self._stream.latest(max_age=3.0)
+            if frame is not None:
+                return frame
+            time.sleep(0.1)
+        return None
+
+    def _recover_stream(self):
+        """Last resort: tear down the stream, reconnect ADB, and try to
+        establish a fresh stream. Returns a frame on success, None on failure.
+        Called at most once per stall; if recovery fails the macro stops."""
+        log("capture stream stalled, attempting recovery...")
+        self._stream.stop()
+
+        if self.adb.reconnect():
+            log("  ADB reconnected")
+        else:
+            log("  ADB reconnect failed, trying stream anyway...")
+
+        log("  re-establishing capture stream...")
+        stream = capture.open_stream(
+            self.adb.adb_exe, self.adb.device,
+            attempts=3, per_attempt_timeout=4.0, on_log=log)
+        if stream is None:
+            log("  stream recovery failed")
+            return None
+
+        self._stream = stream
+        log("  stream recovered")
+        return stream.latest(max_age=3.0)
+
+    # ------------------------------------------------------------------
+    # Detection
+    # ------------------------------------------------------------------
+
+    def _match_in_zone(self, image, tpl, zone):
+        """Match `tpl` over only its vertical zone (e.g. top/bottom 50%) for
+        speed, mapping the result back to full-frame coords. zone 'full' (or
+        unknown) searches the whole frame."""
+        band = config.zone_band(zone, image.shape[0])
+        if band is None:
+            conf, center, _ = multi_scale_match(
+                image, tpl, self.ref_scales, config.REF_DOWNSCALE)
+            return conf, center
+        sub, y_off = crop_band(image, band)
+        conf, center, _ = multi_scale_match(
+            sub, tpl, self.ref_scales, config.REF_DOWNSCALE)
+        if center is not None:
+            center = (center[0], center[1] + y_off)
         return conf, center
 
+    def _find_ref(self, image, key):
+        return self._match_in_zone(
+            image, self.refs[key], self._ref_zone.get(key, "full"))
+
+    def _load_group(self, *names):
+        """Load ref PNGs by name/glob from ref/ -> list of (name, tpl, zone).
+        A trailing '*' globs variants (start-hard-chapter -> -2, ...); missing
+        files are skipped so refs can be added incrementally."""
+        out = []
+        for nm in names:
+            pat = nm if nm.endswith(".png") else nm + ".png"
+            if "*" in pat:
+                paths = sorted(config.REF_DIR.glob(pat))
+            else:
+                p = config.REF_DIR / pat
+                paths = [p] if p.is_file() else []
+            for p in paths:
+                try:
+                    out.append((p.stem, load_template(p),
+                                self._zones.get(p.name, "full")))
+                except (FileNotFoundError, ValueError):
+                    log(f"NOTE: ref '{p.name}' could not load, skipping")
+        return out
+
+    def _detect(self, image, group):
+        """Best match across a group of (name, tpl, zone).  Returns
+        (name, conf, center), or (None, -1.0, None) for an empty group."""
+        best = (None, -1.0, None)
+        for name, tpl, zone in group:
+            conf, center = self._match_in_zone(image, tpl, zone)
+            if conf > best[1]:
+                best = (name, conf, center)
+        return best
+
     def _best_skill_banner(self, image):
-        """Return (label, confidence) for the best-matching banner. The label
-        is only for logging; any banner over threshold means the skill screen
-        is up."""
         best_label, best_conf = None, -1.0
         for key in self.skill_banners:
             conf, _ = self._find_ref(image, key)
@@ -313,17 +516,12 @@ class Macro:
                 best_label, best_conf = key, conf
         return best_label, best_conf
 
-    def _find_best_skill(self, image):
-        """Return (category, name, confidence, center) of the best skill on
-        screen, or (None, None, 0.0, None) if none clear the threshold.
+    def _find_best_skill(self, image, band):
+        """Return (category, name, conf, center) of the best skill on screen,
+        or (None, None, 0.0, None).  Centers are in the (normalised) match
+        space; the caller's _tap converts them to device pixels."""
+        band_img, y_offset = crop_band(image, band)
 
-        Custom priority skills first, then active categories in priority order,
-        best-to-worst within each. Stops at the first icon over threshold.
-        Centres are in full-region coordinates.
-        """
-        band_img, y_offset = crop_band(image, config.SKILL_MATCH_BAND)
-
-        # 1. Custom priority skills, above every category.
         for ident, tpl in self.custom_priority:
             conf, center, _ = multi_scale_match(
                 band_img, tpl, self.skill_scales, config.SKILL_DOWNSCALE)
@@ -331,7 +529,6 @@ class Macro:
                 return ("custom", ident, conf,
                         (center[0], center[1] + y_offset))
 
-        # 2. Active categories, in priority order.
         for category, skills in self.skill_categories:
             for name, tpl in skills:
                 conf, center, _ = multi_scale_match(
@@ -341,326 +538,504 @@ class Macro:
                             (center[0], center[1] + y_offset))
         return None, None, 0.0, None
 
-    def _avoid_skill_in_slot(self, image, slot_screen):
-        """Identifier of the avoid skill shown in the slot at absolute coords
-        `slot_screen`, or None. Only a card-sized box (SKILL_SLOT_BOX) around
-        the slot is checked."""
-        if not self.avoid_skills:
-            return None
-        img_h, img_w = image.shape[:2]
-        cx = slot_screen[0] - config.REGION_X
-        cy = slot_screen[1] - config.REGION_Y
-        bw, bh = config.SKILL_SLOT_BOX
-        x0, x1 = max(0, cx - bw // 2), min(img_w, cx + bw // 2)
-        y0, y1 = max(0, cy - bh // 2), min(img_h, cy + bh // 2)
-        if x1 - x0 < 2 or y1 - y0 < 2:
-            return None
-        crop = image[y0:y1, x0:x1]
-        for ident, tpl in self.avoid_skills:
-            conf, center, _ = multi_scale_match(
-                crop, tpl, self.skill_scales, config.SKILL_DOWNSCALE)
-            if conf >= config.MATCH_THRESHOLD and center is not None:
-                return ident
-        return None
+    def _fallback_slot(self, image, band, slots):
+        """No wanted skill and no refresh: pick the leftmost slot NOT holding an
+        avoid skill.  Avoid skills are located across the whole band (the same
+        robust path wanted skills use) rather than in a fragile fixed box, then
+        each slot's x is checked against them.  Returns (slot_xy, avoid_x_list).
+        """
+        avoid_x = []
+        if self.avoid_skills:
+            band_img, _ = crop_band(image, band)
+            for ident, tpl in self.avoid_skills:
+                conf, center, _ = multi_scale_match(
+                    band_img, tpl, self.skill_scales, config.SKILL_DOWNSCALE)
+                if conf >= config.MATCH_THRESHOLD and center is not None:
+                    avoid_x.append((ident, center[0]))
+        tol = image.shape[1] * 0.15
+        for sx, sy in slots:
+            if not any(abs(sx - ax) <= tol for _, ax in avoid_x):
+                return (sx, sy), avoid_x
+        return slots[0], avoid_x
 
-    def _to_screen(self, center):
-        """Region-relative point -> absolute screen coordinates."""
-        return config.REGION_X + center[0], config.REGION_Y + center[1]
+    def _adjust_speed(self, image):
+        """Detect the speed button and step toward max speed (3x, or 2x when 3x
+        is unavailable on this match).  Returns True if a speed tap was issued.
 
-    # one iteration
+        The button SHOWS the current speed and cycles 1x->2x->3x->1x; we only
+        ever tap to go up.  If tapping at 2x drops us back to 1x, 3x is not
+        available, so we remember that and hold at 2x instead of oscillating.
+        """
+        if not self.speed_refs:
+            return False
+        cur, cur_center, cur_conf = None, None, -1.0
+        for spd, (name, tpl, zone) in self.speed_refs.items():
+            conf, center = self._match_in_zone(image, tpl, zone)
+            if (conf >= config.REF_THRESHOLD and conf > cur_conf
+                    and center is not None):
+                cur, cur_center, cur_conf = spd, center, conf
+        if cur is None:
+            return False
+        if cur == "3x":
+            self._last_speed = "3x"
+            return False                          # already at max
+        if cur == "2x" and self._speed_max_2x:
+            self._last_speed = "2x"
+            return False                          # 2x is this match's cap, hold
+        if cur == "1x" and self._last_speed == "2x":
+            self._speed_max_2x = True             # 2x->1x => 3x not available
+        log(f"speed {cur} -> tapping to raise")
+        self._tap(cur_center[0], cur_center[1], f"speed ({cur} up)")
+        self._last_speed = cur
+        time.sleep(rand_delay(config.ACTION_DELAY))
+        return True
+
+    # ------------------------------------------------------------------
+    # Movement (ADB swipe)
+    # ------------------------------------------------------------------
+
+    def _drag_joystick(self, jx, jy, angle_deg, duration_s, dist):
+        """Swipe-and-hold on the joystick.  (jx, jy, dist) are in the normalised
+        match space; they're converted to device pixels for the ADB swipe, whose
+        duration IS the hold time.  angle: 0=right, 90=up, 180=left, 270=down."""
+        tx = jx + dist * math.cos(math.radians(angle_deg))
+        ty = jy - dist * math.sin(math.radians(angle_deg))
+        n = self._norm or 1.0
+        x1, y1 = round(jx / n), round(jy / n)
+        x2, y2 = round(tx / n), round(ty / n)
+        duration_ms = max(100, int(duration_s * 1000))
+        log(f"  swipe ({x1},{y1})->({x2},{y2})  angle {angle_deg}deg  "
+            f"hold {duration_s:.2f}s")
+        self.adb.swipe(x1, y1, x2, y2, duration_ms)
+
+    def _detect_speed(self, image):
+        """Return (speed_str, center) for the speed button currently shown
+        ('1x'/'2x'/'3x'), or (None, None) if no speed button is visible."""
+        cur, center, best = None, None, -1.0
+        for spd, (name, tpl, zone) in self.speed_refs.items():
+            conf, c = self._match_in_zone(image, tpl, zone)
+            if conf >= config.REF_THRESHOLD and conf > best and c is not None:
+                cur, center, best = spd, c, conf
+        return cur, center
+
+    def _ensure_speed_1x(self, max_wait=2.0, interval=0.25):
+        """Fast-poll the speed button down to 1x.  The button cycles
+        1x->2x->3x->1x, so we just tap until it reads 1x (works whether the
+        match maxes at 2x or 3x).  Tight loop on purpose: speed is the most
+        important thing to fix right after the first skill.  Returns True once 1x
+        is confirmed; False if no speed button shows (no speed control) or it
+        vanishes (a screen came up)."""
+        if not self.speed_refs:
+            return False
+        deadline = time.time() + max_wait
+        seen = False
+        while time.time() < deadline:
+            image, _ = resize_to_width(self._grab(), self.match_width)
+            cur, center = self._detect_speed(image)
+            if cur is None:
+                if seen:
+                    return False             # button left (e.g. a skill screen)
+                time.sleep(interval)
+                continue
+            seen = True
+            self._last_speed = cur
+            if cur == "1x":
+                return True
+            self._tap(center[0], center[1], f"speed {cur}->1x")
+            time.sleep(interval)
+        return seen
+
+    def _do_movement(self, w, h):
+        """Run the configured movement: a swipe-and-hold on the joystick (started
+        at the bottom centre) for each of the mode's two vectors.  Assumes the
+        caller has already set 1x speed.  (w, h) are the normalised frame dims."""
+        if config.MOVEMENT_MODE == 2:
+            # Plant Defense: spawn was determined by the entry button (host vs
+            # guest), recorded in self._plant_spawn -- no image detection needed.
+            spawn = self._plant_spawn
+            params = config.plant_movement(spawn)
+            label = (f"plant defense  spawn {spawn} "
+                     f"({'host/left' if spawn == 1 else 'guest/right'}) / "
+                     f"{config.MOVEMENT_PLANT_PRESET}")
+        else:
+            params = {1: config.MOVEMENT_CHAPTER,
+                      3: config.MOVEMENT_CUSTOM}.get(config.MOVEMENT_MODE)
+            if not params:
+                return
+            label = {1: "chapter", 3: "custom"}.get(config.MOVEMENT_MODE, "?")
+
+        angle1, dur1, angle2, dur2 = params
+        jx = w * config.MOVEMENT_JOYSTICK_X_RATIO
+        jy = h * config.MOVEMENT_JOYSTICK_Y_RATIO
+        dist = h * config.MOVEMENT_SWIPE_LEN_RATIO
+        log(f"movement ({label}): joystick @ bottom-centre, "
+            f"swipe {dist:.0f}px (={config.MOVEMENT_SWIPE_LEN_RATIO:.0%} H)")
+        if dur1 > 0:
+            self._drag_joystick(jx, jy, angle1, dur1, dist)
+        if dur1 > 0 and dur2 > 0:
+            time.sleep(0.3)
+        if dur2 > 0:
+            self._drag_joystick(jx, jy, angle2, dur2, dist)
+
+    def _maybe_arm_movement(self, name):
+        """Arm the movement sequence if a movement mode is selected and `name` is
+        a gamemode start button.  The move then runs once the first skill
+        selection's banner disappears."""
+        if config.MOVEMENT_MODE == 0:
+            return
+        if any(name.startswith(p) for p in MOVEMENT_START_BUTTONS):
+            self._move_armed = True
+            self._move_in_skill = False
+            self._move_action = None
+            # Plant Defense: the start button also tells us the spawn position
+            # (host via start_challenge = 1/left, guest via get-ready = 2/right).
+            for prefix, spawn in PLANT_SPAWN_BY_START:
+                if name.startswith(prefix):
+                    self._plant_spawn = spawn
+                    log(f"  (plant spawn {spawn} = "
+                        f"{'host/left' if spawn == 1 else 'guest/right'}, "
+                        f"from '{name}')")
+                    break
+            log("  (armed: move when the first skill selection ends)")
+
+    # ------------------------------------------------------------------
+    # One iteration
+    # ------------------------------------------------------------------
+
     def step(self):
-        """Inspect the screen once, act on it, and return a state string."""
-        image = grab_screen_bgr(config.BLUESTACKS_REGION)
+        """Capture one frame, act on what's visible, return a state string.
+        Raises ADBError on unrecoverable device failure."""
+        image = self._grab()
+
+        # Normalise to MATCH_WIDTH: one template set fits every device and
+        # matching stays fast.  _norm carries the scale so _tap can convert the
+        # match-space coords it gets back into the device's real pixels.
+        image, self._norm = resize_to_width(image, self.match_width)
 
         if is_blank(image):
             return "blank"
 
-        # 1. Devil offer, checked first so the skill-pick fallback never
-        #    accidentally accepts the deal.
-        conf, center = self._find_ref(image, "devil")
-        if conf >= config.REF_THRESHOLD:
-            log(f"devil offer (conf {conf:.2f}) -> reject")
-            click(*self._to_screen(center), "devil reject")
-            time.sleep(rand_delay(config.ACTION_DELAY))
-            return "devil"
+        h, w = image.shape[:2]
+        # Skill band / fallback slots in THIS frame's match space.
+        band, _first_slot, _second_slot, _ = config.geometry_for(w, h)
 
-        # 2. Skill selection, recognised by any banner.
+        def bottom_tap(label):
+            self._tap(round(w * config.BOTTOM_TAP_X_RATIO),
+                      round(h * config.BOTTOM_TAP_Y_RATIO), label)
+
+        # 1. Skill selection, detected by any banner (valkyrie/level/glory/angel).
         indicator, iconf = self._best_skill_banner(image)
         if iconf >= config.REF_THRESHOLD:
-            category, name, sconf, scenter = self._find_best_skill(image)
+            if self._move_armed:
+                self._move_in_skill = True      # a skill screen is up
+            category, name, sconf, scenter = self._find_best_skill(image, band)
             if name:
                 log(f"skill select [{indicator} {iconf:.2f}] -> "
                     f"{category} / {name} (conf {sconf:.2f})")
-                click(*self._to_screen(scenter), f"skill {category}/{name}")
+                self._tap(scenter[0], scenter[1], f"skill {category}/{name}")
             else:
-                # No wanted skill. Reroll while refresh is available; once it
-                # vanishes (refreshes gone), take a slot.
-                rconf, rcenter = self._find_ref(image, "refresh")
-                if rconf >= config.REF_THRESHOLD:
+                rconf, rcenter = (self._find_ref(image, "refresh")
+                                  if "refresh" in self.refs else (-1.0, None))
+                if rconf >= config.REF_THRESHOLD and rcenter is not None:
                     log(f"skill select [{indicator} {iconf:.2f}] -> no wanted "
-                        f"skill, refresh available ({rconf:.2f}) -> reroll")
-                    click(*self._to_screen(rcenter), "refresh")
+                        f"skill, refresh ({rconf:.2f}) -> reroll")
+                    self._tap(rcenter[0], rcenter[1], "refresh")
                 else:
-                    # Take the first slot, unless it shows an avoid skill, then
-                    # the second.
-                    avoided = self._avoid_skill_in_slot(
-                        image, config.FIRST_SKILL_SLOT)
-                    if avoided:
-                        log(f"skill select [{indicator} {iconf:.2f}] -> no "
-                            f"wanted skill, first slot is avoid skill "
-                            f"({avoided}) -> second slot")
-                        click(*config.SECOND_SKILL_SLOT, "second skill slot")
+                    # Slot layout depends on how many cards the screen shows:
+                    # valkyrie/angel = 2 cards, level/glory = 3.  Tapping the
+                    # 3-card positions on a 2-card screen lands in dead space.
+                    n_cards = 2 if indicator in config.SKILL_BANNERS_2_CARD else 3
+                    sy = round(h * config.SKILL_ROW_Y_RATIO)
+                    slots = [(round(w * xr), sy)
+                             for xr in config.SKILL_SLOT_X_BY_COUNT[n_cards]]
+                    slot, avoid_x = self._fallback_slot(image, band, slots)
+                    if avoid_x:
+                        log(f"skill select [{indicator} {iconf:.2f}] -> no wanted "
+                            f"skill; avoiding {[i for i, _ in avoid_x]} "
+                            f"-> slot x={slot[0]}")
                     else:
-                        log(f"skill select [{indicator} {iconf:.2f}] -> no "
-                            f"wanted skill, no refresh left -> first slot")
-                        click(*config.FIRST_SKILL_SLOT, "first skill slot")
+                        log(f"skill select [{indicator} {iconf:.2f}] -> no wanted "
+                            f"skill, no refresh -> first slot")
+                    self._tap(*slot, "fallback skill slot")
             time.sleep(rand_delay(config.ACTION_DELAY))
             return "skill"
 
-        # 3. Game over / results.
-        conf, center = self._find_ref(image, "game_over")
-        if conf >= config.REF_THRESHOLD:
-            log(f"game over (conf {conf:.2f}) -> dismiss")
-            click(*config.GAME_OVER_TAP, "dismiss")
-            time.sleep(rand_delay(config.ACTION_DELAY))
-            return "game_over"
+        # No banner: the first skill selection's banner just disappeared
+        # (event-based, so it handles the variable co-op skill timer) -> queue
+        # the movement, to run below in gameplay.
+        if self._move_armed and self._move_in_skill:
+            self._move_in_skill = False
+            self._move_action = "move"
 
-        # 4. "Press it when you see it" buttons (Play + get-ready / continue /
-        #    start-challenge), checked in order; first hit wins.
-        for key, label in (("play", "lobby play"),
-                           ("get_ready", "get ready"),
-                           ("continue", "continue"),
-                           ("start_challenge", "start challenge")):
-            conf, center = self._find_ref(image, key)
-            if conf >= config.REF_THRESHOLD:
-                log(f"{label} (conf {conf:.2f}) -> click")
-                click(*self._to_screen(center), label)
+        # 2. Challenge ended (replaces game-over / tap-to-close): wait, then tap
+        #    the dead centre of the screen to dismiss the results.  The end
+        #    screens say "tap empty area to close"; the centre is reliably empty,
+        #    whereas the bottom strip can land on a reward icon and not dismiss.
+        #    Exception: challenge-has-ended3 shows a Continue button rather than
+        #    a tap-to-dismiss area.  Find and tap Continue right here: the end
+        #    banner stays on screen alongside the button, so this branch returns
+        #    on every poll and the tap_buttons scan below is never reached.
+        c3name, c3conf, _ = self._detect(image, self.challenge_ended_continue)
+        if c3conf >= config.REF_THRESHOLD:
+            bname, bconf, bcenter = self._detect(image, self.continue_button)
+            if bconf >= config.REF_THRESHOLD and bcenter is not None:
+                log(f"challenge ended [{c3name} {c3conf:.2f}] -> Continue "
+                    f"({bconf:.2f}) -> tap")
+                self._tap(bcenter[0], bcenter[1], "continue")
                 time.sleep(rand_delay(config.ACTION_DELAY))
-                return key
+            else:
+                log(f"challenge ended [{c3name} {c3conf:.2f}] -> waiting for "
+                    f"Continue button")
+            return "challenge_ended"
+        cname, cconf, _ = self._detect(image, self.challenge_ended)
+        if cconf >= config.REF_THRESHOLD:
+            log(f"challenge ended [{cname} {cconf:.2f}] -> dismiss (centre tap)")
+            time.sleep(rand_delay(config.ACTION_DELAY))
+            self._tap(round(w * 0.50), round(h * 0.50), "dismiss results")
+            time.sleep(rand_delay(config.ACTION_DELAY))
+            return "challenge_ended"
 
-        # 4b. Custom press-it buttons (user-captured in ref/custom/).
-        for name, tpl in self.custom_refs:
-            conf, center, _ = multi_scale_match(image, tpl, self.ref_scales)
+        # 3. Wheel reward (won a skill from the spin): accept with a centre tap.
+        rwname, rwconf, _ = self._detect(image, self.wheel_reward)
+        if rwconf >= config.REF_THRESHOLD:
+            log(f"wheel reward [{rwname} {rwconf:.2f}] -> accept (centre tap)")
+            time.sleep(rand_delay(config.ACTION_DELAY))
+            self._tap(round(w * 0.50), round(h * 0.50), "wheel reward accept")
+            time.sleep(rand_delay(config.ACTION_DELAY))
+            return "wheel_reward"
+
+        # 4. Spin wheel: tap it, then clear any result popups near the bottom.
+        swname, swconf, swcenter = self._detect(image, self.spin_wheel)
+        if swconf >= config.REF_THRESHOLD and swcenter is not None:
+            log(f"spin wheel [{swname} {swconf:.2f}] -> spin, dismiss popups")
+            self._tap(swcenter[0], swcenter[1], "spin wheel")
+            for i in range(2):
+                time.sleep(1.0)
+                bottom_tap(f"wheel popup dismiss {i + 1}")
+            return "spin_wheel"
+
+        # 5. Tap-on-sight buttons (devil reject, play, continue, start*, ...).
+        bname, bconf, bcenter = self._detect(image, self.tap_buttons)
+        if bconf >= config.REF_THRESHOLD and bcenter is not None:
+            log(f"button '{bname}' (conf {bconf:.2f}) -> tap")
+            self._tap(bcenter[0], bcenter[1], bname)
+            self._maybe_arm_movement(bname)
+            time.sleep(rand_delay(config.ACTION_DELAY))
+            return "button"
+
+        # 6. User-captured custom buttons.
+        for name, tpl, zone in self.custom_refs:
+            conf, center = self._match_in_zone(image, tpl, zone)
             if conf >= config.REF_THRESHOLD and center is not None:
-                log(f"custom button '{name}' (conf {conf:.2f}) -> click")
-                click(*self._to_screen(center), f"custom: {name}")
+                log(f"custom button '{name}' (conf {conf:.2f}) -> tap")
+                self._tap(center[0], center[1], f"custom: {name}")
+                self._maybe_arm_movement(name)
                 time.sleep(rand_delay(config.ACTION_DELAY))
                 return "custom"
 
-        # 5. Nothing actionable, the character is playing.
+        # 6.5 Movement: the first skill selection ended -> run the move once, in
+        #     gameplay. Force 1x first (no-op if this mode/co-op has no speed
+        #     button); the wheel that follows is handled by steps 3-4 above, and
+        #     speed returns to max via _adjust_speed once we're unarmed.
+        if self._move_action == "move":
+            self._move_action = None
+            self._move_armed = False
+            if config.MOVEMENT_MODE != 0:
+                time.sleep(0.5)             # let the skill UI finish closing
+                self._ensure_speed_1x()     # 1x if the mode has a speed button
+                self._do_movement(w, h)
+                return "movement"
+
+        # 7. In a match (not mid-movement-sequence): drive speed to max. Held off
+        #    while armed so the forced 1x survives until the movement is done.
+        if not self._move_armed and self._adjust_speed(image):
+            return "speed"
+
+        # 8. Nothing actionable; character is playing.
         return "idle"
 
 
-# scale calibration
-# The bundled templates were captured in BlueStacks fullscreen. At any other
-# window size every template renders (and matches) at a different scale.
-# measure_game_scale() recovers the current scale from one screenshot so the
-# GUI can retune SCALE_RANGE / REF_SCALE_RANGE.
-
-# Coarse brute-force sweep (min, max, step): small scrcpy window through large.
-# The step is coarse on purpose; the refine step pins it down afterwards.
-_SCAN_RANGE = (0.20, 1.80, 0.05)
-
-# Reduced resolution for the scan (multi_scale_match maps sizes back).
-_SCAN_DOWNSCALE = 0.5
-
-# Fine local sweep step after the coarse scan, so the runtime can trust a
-# single scale per match instead of sweeping a margin every frame.
-_REFINE_STEP = 0.0125
-
-# A UI ref at or above this confidence is trusted outright, skipping the
-# (larger) skill-icon scan, the common fast path on a skill screen.
-_REF_EARLY_EXIT = 0.80
-
-# The final best match must clear this, or calibration is rejected.
-_SCAN_MIN_CONF = 0.60
-
-
-def _load_all_skill_templates():
-    """Load every UNIQUE skill icon across all categories, de-duplicated by
-    content (the same skill is copied byte-identically into several folders).
-    Active/avoid lists are ignored: any on-screen icon works for calibration.
-    Returns [(label, template), ...]."""
-    out = []
-    seen = set()
-    for category in config.SKILL_CATEGORIES:
-        for path in list_skill_files(config.SKILLS_DIR / category):
-            h = skill_hash(path)
-            if h is not None:
-                if h in seen:
-                    continue
-                seen.add(h)
-            try:
-                out.append((f"{category}/{path.name}", load_template(path)))
-            except (FileNotFoundError, ValueError):
-                pass
-    return out
-
-
-def _load_calibration_refs():
-    """Load the UI reference templates usable as scale references. Returns
-    [(label, template), ...]; missing/unreadable files are skipped."""
-    out = []
-    for label, path in (("valkyrie", config.REF_VALKYRIE),
-                        ("level", config.REF_LEVEL),
-                        ("glory", config.REF_GLORY),
-                        ("refresh", config.REF_REFRESH),
-                        ("play", config.REF_PLAY),
-                        ("game_over", config.REF_GAME_OVER),
-                        ("devil", config.REF_DEVIL),
-                        ("get_ready", config.REF_GET_READY),
-                        ("continue", config.REF_CONTINUE),
-                        ("start_challenge", config.REF_START_CHALLENGE)):
-        try:
-            out.append((label, load_template(path)))
-        except (FileNotFoundError, ValueError):
-            pass
-    return out
-
-
-def _scan_templates(image, templates, scales, label):
-    """Brute-match every template against `image`.
-
-    `templates` is [(kind, name, tpl), ...]. Returns the best
-    (conf, scale, name, kind, tpl), or None. Progress is logged under `label`.
-    """
-    best = None
-    progress_every = max(1, len(templates) // 4)
-    for i, (kind, name, tpl) in enumerate(templates, start=1):
-        conf, _, size = multi_scale_match(image, tpl, scales, _SCAN_DOWNSCALE)
-        if size is not None and (best is None or conf > best[0]):
-            best = (conf, size[0] / tpl.shape[1], name, kind, tpl)
-        if i % progress_every == 0 or i == len(templates):
-            seen = f"{best[2]} {best[0]:.2f}" if best else "none"
-            log(f"  {label}: scanned {i}/{len(templates)} (best: {seen})")
-    return best
-
-
-def _refine_match_scale(image, tpl, coarse_scale):
-    """Pin a coarse scale down with a fine local sweep on one template.
-    Sweeps +/- one coarse step at _REFINE_STEP. Returns (confidence, scale)
-    of the fine peak, or None."""
-    coarse_step = _SCAN_RANGE[2]
-    lo = max(_REFINE_STEP, coarse_scale - coarse_step)
-    hi = coarse_scale + coarse_step
-    conf, _, size = multi_scale_match(
-        image, tpl, make_scales((lo, hi, _REFINE_STEP)), _SCAN_DOWNSCALE)
-    if size is None:
-        return None
-    return conf, size[0] / tpl.shape[1]
-
+# ------------------------------------------------------------------
+# Scale calibration stub
+# ------------------------------------------------------------------
 
 def measure_game_scale(image):
-    """Work out the game's on-screen scale from a single screenshot.
-
-    `image` is a BGR capture, ideally an active skill-selection screen. UI refs
-    are matched first (a confident one is used outright); otherwise skill icons
-    are scanned too and the highest-confidence match wins. The matched scale
-    and its family's baseline give the zoom, hence the scale both families
-    should match at.
-
-    Returns a dict: on success ok=True with conf, name, kind ("skill"/"ref"),
-    matched_scale, zoom, skill_scale, ref_scale; on failure ok=False + reason.
-    """
-    if is_blank(image):
-        return {"ok": False, "reason": "the screen capture is blank/black"}
-
-    refs = [("ref", n, t) for n, t in _load_calibration_refs()]
-    skills = [("skill", n, t) for n, t in _load_all_skill_templates()]
-    if not refs and not skills:
-        return {"ok": False,
-                "reason": "no skill icons or reference images found to match"}
-
-    scales = make_scales(_SCAN_RANGE)
-    log(f"scale calibration: sweeping {len(scales)} scales "
-        f"({_SCAN_RANGE[0]:g}-{_SCAN_RANGE[1]:g}); "
-        f"{len(refs)} UI ref(s), {len(skills)} skill icon(s)...")
-
-    # UI refs first; a confident match skips the skill scan.
-    best = _scan_templates(image, refs, scales, "UI refs") if refs else None
-    if (best is None or best[0] < _REF_EARLY_EXIT) and skills:
-        log("  no confident UI-ref match, also scanning skill icons...")
-        skill_best = _scan_templates(image, skills, scales, "skill icons")
-        if skill_best is not None and (best is None
-                                       or skill_best[0] > best[0]):
-            best = skill_best
-
-    if best is None:
-        return {"ok": False, "reason": "no template could be matched at all"}
-
-    conf, matched_scale, name, kind, tpl = best
-
-    # Pin the coarse scale down so the derived zoom is accurate enough to drop
-    # the safety margin.
-    refined = _refine_match_scale(image, tpl, matched_scale)
-    if refined is not None:
-        rconf, rscale = refined
-        log(f"  refined scale {matched_scale:.3f} -> {rscale:.3f} "
-            f"(conf {rconf:.2f})")
-        matched_scale = rscale
-        conf = max(conf, rconf)
-
-    if conf < _SCAN_MIN_CONF:
-        return {"ok": False,
-                "reason": (f"best match '{name}' only reached confidence "
-                           f"{conf:.2f} (need >= {_SCAN_MIN_CONF:.2f}); "
-                           f"make sure a skill-selection screen fills the "
-                           f"capture region")}
-
-    baseline = (config.SKILL_SCALE_BASELINE if kind == "skill"
-                else config.REF_SCALE_BASELINE)
-    if not baseline or baseline <= 0:
-        return {"ok": False, "reason": "invalid scale baseline in config"}
-
-    zoom = matched_scale / baseline
+    """OBSOLETE with ADB.  Kept so gui.py's Calibrate button does not crash.
+    Returns a failure result directing the user to the ADB setup instead."""
     return {
-        "ok": True, "conf": conf, "name": name, "kind": kind,
-        "matched_scale": matched_scale, "zoom": zoom,
-        "skill_scale": config.SKILL_SCALE_BASELINE * zoom,
-        "ref_scale": config.REF_SCALE_BASELINE * zoom,
+        "ok": False,
+        "reason": (
+            "Scale calibration via screen capture has been replaced by the "
+            "one-time ADB calibration.  Connect a device via the ADB device "
+            "selector and run Calibrate from there."
+        ),
     }
 
 
-def run_macro(stop_event=None):
-    """Run the macro loop until stopped, timed out, or the fail-safe fires.
+# ------------------------------------------------------------------
+# Plant Defense helpers
+# ------------------------------------------------------------------
 
-    `stop_event` is an optional threading.Event; when set the loop exits at the
-    next check. Config is read here, so the GUI applies settings before a run.
+def run_plant_movement(adb_client, spawn=1, on_log=None):
+    """Execute the configured Plant Defense movement for a given spawn, in real
+    device pixels. Called by the GUI 'Conduct Movement' button so the user can
+    test and tune the movement (and verify each spawn's path) outside of a full
+    macro run. In a real run the spawn comes from the entry button instead.
+
+    The joystick start and swipe length are derived from the device resolution
+    (config.PHONE_RESOLUTION), so no frame capture is needed."""
+    _log = on_log or log
+    w, h = config.PHONE_RESOLUTION
+    if not w or not h:
+        _log("plant movement: device resolution unknown -- run Setup Wizard first")
+        return
+
+    params = config.plant_movement(spawn)
+    angle1, dur1, angle2, dur2 = params
+    _log(f"plant movement: preset={config.MOVEMENT_PLANT_PRESET} "
+         f"spawn={spawn} ({'host/left' if spawn == 1 else 'guest/right'}) "
+         f"T={config.MOVEMENT_PLANT_T}s  "
+         f"({angle1:.0f}°×{dur1:.2f}s, {angle2:.0f}°×{dur2:.2f}s)")
+
+    jx = w * config.MOVEMENT_JOYSTICK_X_RATIO
+    jy = h * config.MOVEMENT_JOYSTICK_Y_RATIO
+    dist = h * config.MOVEMENT_SWIPE_LEN_RATIO
+
+    def _swipe(angle_deg, duration_s):
+        # jx/jy/dist are already in device pixels (from PHONE_RESOLUTION).
+        tx = jx + dist * math.cos(math.radians(angle_deg))
+        ty = jy - dist * math.sin(math.radians(angle_deg))
+        x1, y1 = round(jx), round(jy)
+        x2, y2 = round(tx), round(ty)
+        dur_ms = max(100, int(duration_s * 1000))
+        _log(f"  swipe ({x1},{y1})->({x2},{y2})  angle {angle_deg:.0f}°  "
+             f"hold {duration_s:.2f}s")
+        adb_client.swipe(x1, y1, x2, y2, dur_ms)
+
+    if dur1 > 0:
+        _swipe(angle1, dur1)
+    if dur1 > 0 and dur2 > 0:
+        time.sleep(0.3)
+    if dur2 > 0:
+        _swipe(angle2, dur2)
+
+
+# ------------------------------------------------------------------
+# Run loop
+# ------------------------------------------------------------------
+
+def run_macro(stop_event=None):
+    """Run the macro until stopped, timed out, or the Esc failsafe fires.
+
+    `stop_event` is a threading.Event; pass None for headless use (one is
+    created internally).  Config is read here, so the GUI applies settings
+    before calling this.
     """
+    global _active_adb
+
+    if stop_event is None:
+        stop_event = threading.Event()
+
     log("A2 Macro Controller")
-    log(f"region={config.BLUESTACKS_REGION}  first-slot={config.FIRST_SKILL_SLOT}")
     log("active skill categories: "
         + (", ".join(config.ACTIVE_CATEGORIES) or "(none)"))
 
+    # Connect to ADB device.
     try:
-        macro = Macro()
-    except (FileNotFoundError, ValueError) as e:
-        log(f"FATAL: {e}")
+        adb_client = ADBClient()
+        if config.ADB_DEVICE:
+            adb_client.connect(config.ADB_DEVICE)
+        else:
+            serial = adb_client.auto_connect()
+            config.ADB_DEVICE = serial
+    except ADBError as e:
+        log(f"FATAL: ADB connection failed: {e}")
         return
 
-    log(f"focus the game window (BlueStacks or scrcpy) now, starting in "
-        f"{config.STARTUP_DELAY:.0f}s")
+    _active_adb = adb_client
+
+    # The screenshot is the authoritative coordinate space: every tap lands in
+    # the same pixel grid screencap returns.  Derive resolution from a probe
+    # frame (not the flaky `wm size`, which returns empty on some emulators) and
+    # rebuild the skill band / slot / game-over coords for the real size.  This
+    # is what stops a stale PHONE_RESOLUTION from putting the band off-screen.
+    try:
+        probe = adb_client.screenshot()
+        h, w = probe.shape[:2]
+        config.PHONE_RESOLUTION = [w, h]
+        config.resolve_geometry(w, h)   # device-space coords for the GUI/settings
+        norm = config.MATCH_WIDTH / w if w else 1.0
+        log(f"device: {adb_client.device}  resolution: {w}x{h} (from screencap)")
+        log(f"  matching at {config.MATCH_WIDTH}px wide (scale {norm:.3f}); "
+            f"taps map back to real device pixels")
+    except ADBError as e:
+        log(f"WARNING: could not capture a probe frame: {e}")
+        log("  using cached geometry; detection may be off until reconnected")
+
+    # Input sanity probe: detection (screencap) can work while `adb shell input`
+    # is dead, so warn loudly rather than tapping into the void.
+    if not adb_client.shell_works():
+        log("WARNING: 'adb shell' is not responding -- taps will NOT register.")
+        log("  If this is BlueStacks: turn ON 'Android Debug Bridge' in its")
+        log("  Settings > Advanced, then restart BlueStacks and reconnect.")
+
+    # Capture stream (screenrecord). When USE_STREAM_CAPTURE is on it is
+    # REQUIRED, not best-effort: it keeps the surface composited (no black
+    # frames) and is far faster than per-poll screencap. We retry to establish
+    # it and refuse to run if it never connects -- a slow/black screencap loop
+    # runs so poorly that not running at all is the better outcome.
+    stream = None
+    if config.USE_STREAM_CAPTURE:
+        if not capture.streaming_available():
+            log(f"FATAL: {capture.unavailable_reason()}.")
+            log("  Streaming capture is required. Install PyAV (pip install av),")
+            log("  or set USE_STREAM_CAPTURE = False to use screencap mode.")
+            return
+        stream = capture.open_stream(
+            adb_client.adb_exe, adb_client.device,
+            attempts=3, per_attempt_timeout=4.0, on_log=log)
+        if stream is None:
+            log("FATAL: could not establish the screenrecord stream after "
+                "several attempts.")
+            log("  Refusing to run on slow screencap. Check the device screen "
+                "is on and the USB/ADB connection is stable, then start again.")
+            return
+        log("capture: streaming via screenrecord (fast, no black frames)")
+    else:
+        log("capture: screencap mode (USE_STREAM_CAPTURE is off) -- slower, "
+            "and black on BlueStacks during gameplay")
+
+    _start_failsafe_listener(stop_event)
+
+    try:
+        macro = Macro(adb_client, stream=stream)
+    except (FileNotFoundError, ValueError) as e:
+        log(f"FATAL: {e}")
+        if stream is not None:
+            stream.stop()
+        return
+
+    log(f"ADB ready, starting in {config.STARTUP_DELAY:.0f}s "
+        f"(press Esc or the Stop button to stop)")
     _interruptible_sleep(config.STARTUP_DELAY, stop_event)
-    if stop_event is not None and stop_event.is_set():
+    if stop_event.is_set():
         log("stopped before the run started")
         return
 
-    # Run timeout: stop (and close the window if CLOSE_ON_TIMEOUT) after
-    # RUN_TIMEOUT_HOURS. 0 / None disables it.
     timeout_hours = config.RUN_TIMEOUT_HOURS or 0
     deadline = time.monotonic() + timeout_hours * 3600 if timeout_hours else None
     if deadline:
-        log(f"running, timeout in {timeout_hours:g}h; Ctrl+C, the Stop "
-            "button, or the mouse in a screen corner stops it")
+        log(f"running, timeout in {timeout_hours:g}h")
     else:
-        log("running, Ctrl+C, the Stop button, or the mouse in a screen "
-            "corner stops it")
+        log("running with no timeout")
 
     timed_out = False
     last_state = None
+    consec_black = 0
+    BLACK_GIVE_UP = 40   # stop only after a long unbroken run of black frames
     try:
         while True:
-            if stop_event is not None and stop_event.is_set():
+            if stop_event.is_set():
                 log("stop requested, stopping")
                 break
             if deadline and time.monotonic() >= deadline:
@@ -670,17 +1045,34 @@ def run_macro(stop_event=None):
 
             try:
                 state = macro.step()
-            except pyautogui.FailSafeException:
-                log("fail-safe triggered, stopping")
+                consec_black = 0
+            except BlackFrameError:
+                # All-black capture: keep polling, it usually recovers. Do NOT
+                # treat as a disconnect (the connection is fine).
+                consec_black += 1
+                if consec_black == 1:
+                    log("WARNING: screen capture came back all-black.")
+                    log("  If this is BlueStacks: open Settings > Graphics and "
+                        "switch the Renderer (e.g. to OpenGL / Compatibility), "
+                        "then restart BlueStacks -- the renderer can stop "
+                        "exposing frames to screencap.")
+                    log("  (Otherwise the device screen may be off.) Waiting...")
+                elif consec_black % 10 == 0:
+                    log(f"  still all-black ({consec_black} in a row)...")
+                if consec_black >= BLACK_GIVE_UP:
+                    log("giving up after a long run of black frames; stopping")
+                    break
+                _interruptible_sleep(rand_delay(config.POLL_INTERVAL), stop_event)
+                continue
+            except ADBError as e:
+                log(f"ADB error: {e}")
+                log("device disconnected; stopping")
                 break
 
-            # Log quiet states only when they first occur.
             if state in ("idle", "blank") and state != last_state:
                 if state == "blank":
-                    log("WARNING: capture is blank/black, on BlueStacks set "
-                        "the graphics renderer to OpenGL; on scrcpy make sure "
-                        "the mirror window is visible and the phone screen is "
-                        "on")
+                    log("WARNING: ADB screencap is blank -- make sure the "
+                        "device screen is on and the app is in the foreground")
                 else:
                     log("in-game, waiting")
             last_state = state
@@ -689,11 +1081,12 @@ def run_macro(stop_event=None):
     except KeyboardInterrupt:
         log("stopped by user")
 
+    if stream is not None:
+        stream.stop()
+
     if timed_out:
-        # Sleep the phone (scrcpy only) before closing the window; the two are
-        # independent timeout actions.
-        if config.SLEEP_PHONE_ON_TIMEOUT and _is_running("scrcpy.exe"):
-            sleep_phone()
+        if config.SLEEP_PHONE_ON_TIMEOUT:
+            adb_client.sleep_phone()
         if config.CLOSE_ON_TIMEOUT:
             log("closing the game window")
             close_target()

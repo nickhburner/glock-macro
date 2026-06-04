@@ -1,31 +1,34 @@
-"""Calibration / diagnostic tool.
-Captures the configured region and reports what the macro
-would see.
+"""Diagnostic tool for A2 Macro Controller.
+
+Connects to the ADB device, takes a screenshot, and reports what the
+macro sees: ADB connection status, template-match results, and which
+skill or UI element would be acted on.
+
 Usage:
-    python diagnose.py            # capture region + run all checks
-    python diagnose.py full       # also save a full-screen capture
+    python diagnose.py            # connect, screenshot, run all checks
+    python diagnose.py save       # also write an annotated debug image
 """
 
 import sys
 import time
+from pathlib import Path
 
 import cv2
 import numpy as np
-import pyautogui
 
 import config
+from adb import ADBClient, ADBError, find_adb, list_devices
 from matcher import (
-    grab_screen_bgr,
     is_blank,
     list_skill_files,
     load_template,
-    make_scales,
     multi_scale_match,
+    resize_to_width,
+    save_image,
 )
 
-COUNTDOWN = 4
-CAPTURE_PATH = config.BASE_DIR / "debug_capture.png"
-FULLSCREEN_PATH = config.BASE_DIR / "debug_fullscreen.png"
+CAPTURE_PATH    = config.BASE_DIR / "debug_capture.png"
+ANNOTATED_PATH  = config.BASE_DIR / "debug_annotated.png"
 
 
 def banner(text):
@@ -34,90 +37,150 @@ def banner(text):
     print("=" * 60)
 
 
-def check_dpi():
-    """Warn if captured pixel size differs from the logical screen size, which
-    means Windows display scaling will throw off click coordinates."""
-    banner("DISPLAY / DPI CHECK")
-    logical = pyautogui.size()
-    shot = pyautogui.screenshot()
-    pixels = shot.size
-    print(f"  logical screen size (pyautogui.size): {logical[0]} x {logical[1]}")
-    print(f"  captured screenshot size:             {pixels[0]} x {pixels[1]}")
-    if (logical[0], logical[1]) != pixels:
-        print("  WARNING: sizes differ -> Windows display scaling is active.")
-        print("  Clicks may land in the wrong place. Set Windows display")
-        print("  scaling to 100%, OR re-measure all coordinates with the")
-        print("  same scaling that is active when the macro runs.")
-    else:
-        print("  OK, no scaling mismatch.")
-    return shot
+# ------------------------------------------------------------------
+# ADB diagnostics
+# ------------------------------------------------------------------
+
+def check_adb():
+    """Verify the ADB binary, list devices, connect, and return an
+    ADBClient ready for screencap -- or None on failure."""
+    banner("ADB CONNECTION CHECK")
+
+    # Locate adb binary.
+    try:
+        adb_exe = find_adb(config.ADB_PATH)
+        print(f"  adb binary : {adb_exe}")
+    except RuntimeError as e:
+        print(f"  ERROR: {e}")
+        return None
+
+    # List all devices.
+    devices = list_devices(adb_exe)
+    if not devices:
+        print("  No devices found.  Connect a phone via USB or start "
+              "BlueStacks with ADB enabled.")
+        return None
+    print(f"  Found {len(devices)} device(s):")
+    for d in devices:
+        print(f"    {d['label']}  state={d['state']}")
+
+    # Connect to configured or auto-selected device.
+    adb = ADBClient(adb_exe=adb_exe)
+    try:
+        if config.ADB_DEVICE:
+            adb.connect(config.ADB_DEVICE)
+            print(f"  Connected to configured device: {config.ADB_DEVICE}")
+        else:
+            serial = adb.auto_connect()
+            print(f"  Auto-connected to: {serial}")
+    except ADBError as e:
+        print(f"  ERROR: {e}")
+        return None
+
+    # Resolution.
+    try:
+        w, h = adb.resolution()
+        print(f"  Resolution : {w} x {h}")
+    except ADBError as e:
+        print(f"  WARNING: could not query resolution: {e}")
+
+    # Calibration info.
+    print(f"  CALIBRATED_SCALE : {config.CALIBRATED_SCALE}")
+    print(f"  skill scales = {[round(s, 3) for s in config.skill_scales()]}")
+    print(f"  ref scales   = {[round(s, 3) for s in config.ref_scales()]}")
+
+    print("  OK, ADB connection is healthy.")
+    return adb
 
 
-def capture_region():
-    banner("REGION CAPTURE")
-    print(f"  region = {config.BLUESTACKS_REGION}")
-    print(f"  focus the game window (BlueStacks or scrcpy) now, "
-          f"capturing in {COUNTDOWN}s...")
-    for i in range(COUNTDOWN, 0, -1):
-        print(f"    {i}...", flush=True)
-        time.sleep(1)
+# ------------------------------------------------------------------
+# Screenshot
+# ------------------------------------------------------------------
 
-    image = grab_screen_bgr(config.BLUESTACKS_REGION)
+def capture_screen(adb):
+    """Take an ADB screenshot and return the BGR numpy array."""
+    banner("SCREENSHOT")
+    print("  Capturing via ADB...")
+    t0 = time.time()
+    try:
+        image = adb.screenshot(black_retries=2)
+    except ADBError as e:
+        print(f"  ERROR: {e}")
+        return None
+
+    elapsed = time.time() - t0
+    h, w = image.shape[:2]
+    mean = float(np.asarray(image).mean())
+    std  = float(np.asarray(image).std())
+    print(f"  size: {w} x {h}   mean: {mean:.1f}   std: {std:.1f}   "
+          f"took {elapsed:.2f}s")
+
     cv2.imwrite(str(CAPTURE_PATH), image)
-    print(f"  saved capture -> {CAPTURE_PATH}")
+    print(f"  saved -> {CAPTURE_PATH}")
 
-    arr = np.asarray(image)
-    print(f"  size: {arr.shape[1]} x {arr.shape[0]}   "
-          f"mean: {arr.mean():.1f}   std: {arr.std():.1f}")
     if is_blank(image):
-        print("  WARNING: capture is blank/uniform (likely all black).")
+        print("  WARNING: capture is blank/uniform.  Make sure the device "
+              "screen is on and the app is running.")
     else:
-        print("  OK, capture has real content.")
+        print("  OK, capture has content.")
     return image
 
 
-def check_refs(image):
+# ------------------------------------------------------------------
+# Reference-image check
+# ------------------------------------------------------------------
+
+def check_refs(image, norm=1.0):
     banner("REFERENCE IMAGE MATCHES")
-    print(f"  ref threshold = {config.REF_THRESHOLD}\n")
-    ref_scales = make_scales(config.REF_SCALE_RANGE)
-    refs = {
-        "play_button": config.REF_PLAY,
-        "devil_reject": config.REF_DEVIL,
-        "game_over": config.REF_GAME_OVER,
-        "valkyrie": config.REF_VALKYRIE,
-        "level": config.REF_LEVEL,
-        "glory": config.REF_GLORY,
-        "refresh": config.REF_REFRESH,
-        "get-ready": config.REF_GET_READY,
-        "continue": config.REF_CONTINUE,
-        "start_challenge": config.REF_START_CHALLENGE,
-    }
-    for name, path in refs.items():
+    scales = config.ref_scales()
+    print(f"  ref scales = {[round(s, 3) for s in scales]}   "
+          f"threshold = {config.REF_THRESHOLD}   (coords = device pixels)\n")
+
+    # Test EVERY ref the macro can use, not a fixed subset: every PNG in ref/
+    # plus the custom buttons in ref/custom/.  The old hardcoded list silently
+    # skipped newer refs (challenge-has-ended*, the speed/spin/wheel refs), so a
+    # missing or mismatched end-screen ref looked fine here when it was not.
+    paths = sorted(config.REF_DIR.glob("*.png"))
+    paths += sorted(config.REF_CUSTOM_DIR.glob("*.png"))
+    if not paths:
+        print(f"  no ref images found in {config.REF_DIR}")
+        return
+    for path in paths:
+        rel = (path.name if path.parent == config.REF_DIR
+               else f"custom/{path.name}")
         try:
             tpl = load_template(path)
         except (FileNotFoundError, ValueError) as e:
-            print(f"  {name:14s}: MISSING ({e})")
+            print(f"  {rel:26s}: MISSING ({e})")
             continue
         if is_blank(tpl):
-            print(f"  {name:14s}: BLANK placeholder, re-capture this image")
+            print(f"  {rel:26s}: BLANK placeholder, re-capture this image")
             continue
-        conf, center, size = multi_scale_match(image, tpl, ref_scales)
+        conf, center, _ = multi_scale_match(image, tpl, scales,
+                                            config.REF_DOWNSCALE)
         verdict = "MATCH" if conf >= config.REF_THRESHOLD else "no match"
-        loc = f"region {center}" if center else "n/a"
-        print(f"  {name:14s}: conf {conf:.3f}  [{verdict}]  {loc}")
+        loc = (f"({round(center[0] / norm)}, {round(center[1] / norm)})"
+               if center else "n/a")
+        print(f"  {rel:26s}: conf {conf:.3f}  [{verdict}]  @ {loc}")
 
 
-def check_skills(image):
+# ------------------------------------------------------------------
+# Skill-icon check
+# ------------------------------------------------------------------
+
+def check_skills(image, norm=1.0, band=None):
     banner("SKILL MATCHES (active categories)")
-    print(f"  skill threshold = {config.MATCH_THRESHOLD}   "
+    if band is None:
+        band = config.SKILL_MATCH_BAND
+    scales = config.skill_scales()
+    print(f"  skill scales = {[round(s, 3) for s in scales]}   "
+          f"threshold = {config.MATCH_THRESHOLD}   "
           f"downscale = {config.SKILL_DOWNSCALE}")
     print("  active categories: "
           + (", ".join(config.ACTIVE_CATEGORIES) or "(none)"))
     print("  (only meaningful when a skill-selection screen is captured)\n")
-    skill_scales = make_scales(config.SCALE_RANGE)
 
-    # Active categories in priority order as the macro scans them.
-    results = []  # (category, name, conf, center, scale)
+    results = []
     t0 = time.time()
     for category in config.ACTIVE_CATEGORIES:
         files = list_skill_files(config.SKILLS_DIR / category)
@@ -131,67 +194,119 @@ def check_skills(image):
                 print(f"  {category}/{path.name}: MISSING ({e})")
                 continue
             conf, center, size = multi_scale_match(
-                image, tpl, skill_scales, config.SKILL_DOWNSCALE)
-            scale = size[0] / tpl.shape[1] if size else 0.0
-            results.append((category, path.name, conf, center, scale))
-    print(f"\n  scanned {len(results)} icon(s) in {time.time() - t0:.1f}s "
-          f"(the macro stops at the first match, so it is usually faster)\n")
+                image, tpl, scales, config.SKILL_DOWNSCALE)
+            results.append((category, path.name, conf, center))
+    print(f"  scanned {len(results)} icon(s) in {time.time() - t0:.1f}s\n")
 
     if not results:
-        print("  no skill icons to scan, add PNGs to the skills/ category "
-              "subfolders.")
+        print("  no skill icons to scan -- add PNGs to the skills/ folders")
         return
+
+    def dev(center):
+        return (round(center[0] / norm), round(center[1] / norm)) if center else None
 
     by_conf = sorted(results, key=lambda r: r[2], reverse=True)
     print("  top 5 template matches (by confidence):")
-    for category, name, conf, center, scale in by_conf[:5]:
+    for category, name, conf, center in by_conf[:5]:
         verdict = "MATCH" if conf >= config.MATCH_THRESHOLD else "no match"
-        print(f"    {category}/{name:8s}  conf {conf:.3f}  scale {scale:.2f}  "
-              f"[{verdict}]  region {center}")
+        loc = f"{dev(center)}" if center else "n/a"
+        print(f"    {category}/{name:8s}  conf {conf:.3f}  [{verdict}]  @ {loc}")
 
-    matched_scales = [r[4] for r in results if r[2] >= config.MATCH_THRESHOLD]
-    if matched_scales:
-        print(f"\n  matches landed at scales {min(matched_scales):.2f}-"
-              f"{max(matched_scales):.2f}  (SCALE_RANGE is {config.SCALE_RANGE};"
-              f" narrowing it toward this range is the biggest extra speed-up)")
-
-    # Mirror the macro's pick
-    band = config.SKILL_MATCH_BAND
+    # Mirror the macro's pick logic (band is in match space).
     pick = None
     outside = []
-    for category, name, conf, center, scale in results:   # priority order
+    for category, name, conf, center in results:
         if conf < config.MATCH_THRESHOLD or center is None:
             continue
         if band is None or band[0] <= center[1] <= band[1]:
             if pick is None:
-                pick = (category, name, conf)
+                pick = (category, name, conf, center)
         else:
             outside.append((f"{category}/{name}", center))
 
     if pick:
         print(f"\n  -> macro would pick: {pick[0]} / {pick[1]}  "
-              f"(conf {pick[2]:.3f}, first skill above threshold)")
+              f"(conf {pick[2]:.3f})  tap device {dev(pick[3])}")
     else:
-        print(f"\n  -> no skill above threshold; macro would click "
-              f"the first slot {config.FIRST_SKILL_SLOT}")
+        print(f"\n  -> no skill above threshold; macro would tap "
+              f"first slot (match space {config.FIRST_SKILL_SLOT})")
 
     if outside:
-        print(f"  NOTE: {len(outside)} match(es) fell outside SKILL_MATCH_BAND "
+        print(f"  NOTE: {len(outside)} match(es) outside the skill band "
               f"{band}: " + ", ".join(f"{n}@y{c[1]}" for n, c in outside))
-        print("  If a real skill icon is among them, widen SKILL_MATCH_BAND.")
+        print("  If real skills are among them, adjust the band ratios.")
 
+
+# ------------------------------------------------------------------
+# Annotated image
+# ------------------------------------------------------------------
+
+def save_annotated(image):
+    """Draw match boxes for all refs over threshold and save to disk."""
+    if image is None:
+        return
+    annotated = image.copy()
+    ref_scales = config.ref_scales()
+
+    refs = {
+        "play": config.REF_PLAY, "devil": config.REF_DEVIL,
+        "game_over": config.REF_GAME_OVER, "valkyrie": config.REF_VALKYRIE,
+        "level": config.REF_LEVEL, "glory": config.REF_GLORY,
+        "refresh": config.REF_REFRESH,
+    }
+    for name, path in refs.items():
+        try:
+            tpl = load_template(path)
+        except (FileNotFoundError, ValueError):
+            continue
+        conf, center, size = multi_scale_match(annotated, tpl, ref_scales)
+        if conf >= config.REF_THRESHOLD and center and size:
+            x0 = center[0] - size[0] // 2
+            y0 = center[1] - size[1] // 2
+            x1 = x0 + size[0]
+            y1 = y0 + size[1]
+            cv2.rectangle(annotated, (x0, y0), (x1, y1), (0, 255, 0), 2)
+            cv2.putText(annotated, f"{name} {conf:.2f}", (x0, max(0, y0 - 4)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+
+    cv2.imwrite(str(ANNOTATED_PATH), annotated)
+    print(f"\n  Annotated image saved -> {ANNOTATED_PATH}")
+
+
+# ------------------------------------------------------------------
+# Entry point
+# ------------------------------------------------------------------
 
 def main():
-    want_fullscreen = len(sys.argv) > 1 and sys.argv[1].lower() == "full"
+    want_save = len(sys.argv) > 1 and sys.argv[1].lower() == "save"
 
-    shot = check_dpi()
-    if want_fullscreen:
-        shot.save(FULLSCREEN_PATH)
-        print(f"  saved full screen -> {FULLSCREEN_PATH}")
+    adb = check_adb()
+    if adb is None:
+        print("\nADB check failed -- fix the issues above and re-run.")
+        return
 
-    image = capture_region()
-    check_refs(image)
-    check_skills(image)
+    image = capture_screen(adb)
+    if image is None:
+        print("\nCould not capture screen -- check device connection.")
+        return
+
+    # Mirror the macro: normalise the capture to MATCH_WIDTH and match there,
+    # converting reported coords back to device pixels.
+    dev_h, dev_w = image.shape[:2]
+    config.PHONE_RESOLUTION = [dev_w, dev_h]
+    match_img, norm = resize_to_width(image, config.MATCH_WIDTH)
+    mh, mw = match_img.shape[:2]
+    band, first, second, go = config.geometry_for(mw, mh)
+    config.resolve_geometry(dev_w, dev_h)   # device-space coords for settings parity
+    print(f"  device {dev_w}x{dev_h} -> matching at {mw}x{mh} (scale {norm:.3f})")
+    print(f"  band {band}  slots {first}/{second}  game-over {go}  (match space)")
+
+    check_refs(match_img, norm)
+    check_skills(match_img, norm, band)
+
+    if want_save:
+        save_annotated(match_img)
+
 
 if __name__ == "__main__":
     main()

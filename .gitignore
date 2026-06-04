@@ -10,9 +10,15 @@ dist/
 # Diagnostic captures
 debug_capture.png
 debug_fullscreen.png
+debug_annotated.png
 
 # Raw asset source (only needed to re-run flatten_backgrounds.py)
 skills_raw/
 
 # Per-machine settings; ship settings.example.json instead
 settings.json
+
+# Dev screenshots / test images
+*.png.bak
+2 skill.png
+3 skill.png
