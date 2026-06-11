@@ -277,6 +277,53 @@ def list_devices(adb_exe: str, discover: bool = True) -> list[dict]:
     return devices
 
 
+def choose_server_port(adb_exe: Optional[str] = None) -> Optional[int]:
+    """Decide which adb SERVER port this process should use and pin it via the
+    ANDROID_ADB_SERVER_PORT env var (all adb subprocesses inherit it).
+
+    Prefer the isolated port (``config.ADB_SERVER_PORT``), which sidesteps the
+    BlueStacks "version war": BlueStacks ships an old HD-Adb (1.0.36) that squats
+    on the shared default port 5037 and gets killed+restarted by the modern SDK
+    adb on every command, briefly dropping USB phones from ``adb devices``. Our
+    own server on a private port never fights it.
+
+    Self-healing safety net: a USB device is exclusive to one adb server, so if
+    the isolated server sees nothing while the system default server DOES own a
+    device, share the system server instead -- otherwise we would be blind to a
+    phone something else already holds. (With BlueStacks-only or USB-driven-by-us
+    setups nothing else holds the phone, so the isolated port simply wins.)
+
+    Returns the chosen port, or None when sharing the system default server.
+    """
+    import os
+    import config
+    pref = getattr(config, "ADB_SERVER_PORT", None)
+    if not pref:
+        os.environ.pop("ANDROID_ADB_SERVER_PORT", None)
+        return None
+    if adb_exe is None:
+        adb_exe = find_adb(getattr(config, "ADB_PATH", "adb"))
+
+    # 1) Try the isolated port. discover=True so a BlueStacks instance (TCP) is
+    #    connected onto this server and shows up too.
+    os.environ["ANDROID_ADB_SERVER_PORT"] = str(pref)
+    if list_devices(adb_exe, discover=True):
+        return int(pref)
+
+    # 2) Isolated server is empty -- does the system default server own a device
+    #    (e.g. another adb client already grabbed the USB phone)? If so, share it.
+    os.environ.pop("ANDROID_ADB_SERVER_PORT", None)
+    if list_devices(adb_exe, discover=True):
+        log.warning("adb: a device is owned by the system adb server on the "
+                    "default port; sharing it instead of isolated port %s.", pref)
+        return None
+
+    # 3) Nothing visible anywhere -- keep the isolated, war-proof port; a device
+    #    will appear on it once connected.
+    os.environ["ANDROID_ADB_SERVER_PORT"] = str(pref)
+    return int(pref)
+
+
 # ------------------------------------------------------------------
 # Black frame detection
 # ------------------------------------------------------------------
@@ -421,12 +468,20 @@ class ADBClient:
         if "failed" in output.lower() or "refused" in output.lower():
             raise ADBError(f"adb connect {serial} failed: {output}")
 
-    def connect(self, serial: str) -> None:
+    def connect(self, serial: str, ready_timeout: float = 6.0) -> None:
         """
         Select a device and, for network devices (BlueStacks / TCP), issue
         `adb connect` to ensure the connection is established.
 
-        Raises ADBError if the device ends up offline or unauthorised.
+        Polls `adb devices` for up to `ready_timeout` seconds waiting for the
+        device to show up ready, instead of giving up on a single check: a
+        freshly (re)started adb server takes ~1-3s to re-enumerate a USB phone,
+        so a one-shot check can fail on a device that is perfectly fine. (The
+        dedicated server port set by config.apply_adb_server_port() should keep
+        the server from being restarted under us in the first place; this poll is
+        belt-and-braces for slow enumeration and transient `offline` states.)
+
+        Raises ADBError if the device stays offline/unauthorised or never appears.
         """
         self._device = serial
         self._is_network_device = bool(
@@ -435,22 +490,31 @@ class ADBClient:
         if self._is_network_device:
             self._adb_connect(serial)
 
-        # Verify the device is ready
-        devices = list_devices(self._adb)
-        for d in devices:
-            if d["serial"] == serial:
-                if d["state"] == "device":
-                    log.info("ADB connected to %s (%s)", serial, d["type"])
-                    return
-                elif d["state"] == "unauthorized":
-                    raise ADBError(
-                        f"Device {serial} is unauthorised. "
-                        "Enable USB debugging and accept the host key on the device."
-                    )
-                else:
-                    raise ADBError(
-                        f"Device {serial} is {d['state']}, not ready."
-                    )
+        # Verify the device is ready, retrying until ready_timeout. discover is
+        # off here: the explicit _adb_connect above already established a network
+        # target, and a USB phone never needs the localhost emulator-port probing
+        # (which only churns the server and slows each poll).
+        deadline = time.time() + max(0.0, ready_timeout)
+        last_state = None
+        while True:
+            for d in list_devices(self._adb, discover=False):
+                if d["serial"] == serial:
+                    last_state = d["state"]
+                    if d["state"] == "device":
+                        log.info("ADB connected to %s (%s)", serial, d["type"])
+                        return
+                    if d["state"] == "unauthorized":
+                        raise ADBError(
+                            f"Device {serial} is unauthorised. Enable USB "
+                            "debugging and accept the host key on the device."
+                        )
+                    break  # offline / other transient state -> keep polling
+            if time.time() >= deadline:
+                break
+            time.sleep(0.4)
+
+        if last_state and last_state != "device":
+            raise ADBError(f"Device {serial} is {last_state}, not ready.")
         raise ADBError(
             f"Device {serial} not found in `adb devices` after connect."
         )

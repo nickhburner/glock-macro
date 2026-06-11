@@ -1,77 +1,70 @@
 """Eternal Lode minigame macro.
-The board is a 6-col x 8-row grid of clickable squares. A green level marker
-sits on the top border of the primary row (the row below it); the macro only
-acts on that primary row.
 
-Board location is calibrated once on startup; the level marker drives
-per-iteration vertical alignment.
+Detection is brightness-based: the game renders diggable cells at full
+brightness and non-diggable (hidden) cells dimmed. A simple average-
+brightness threshold cleanly separates the two (gap of ~30 points on every
+tested device). Template matching then classifies the bright cells by type.
+
+Board geometry is anchored to the green depth-frontier line each iteration
+(stable, always visible). The line gives board left/right and cell width,
+from which a device_scale is derived to pre-scale all templates once.
 """
 
+import random
 import time
 
+import cv2
+import numpy as np
+
 import config
-from adb import ADBClient, ADBError
+from adb import ADBClient, ADBError, choose_server_port
 from main import (
     _interruptible_sleep,
-    _start_failsafe_listener,
     close_target,
     log,
     rand_delay,
     sleep_phone,
 )
-from matcher import (
-    is_blank,
-    load_template,
-    multi_scale_match,
-)
+from matcher import load_template
 
-import random
-
-
-# Cell types best-first.
-_PRIORITY = [
-    "chest",
-    "dirt15-gem",
-    "dirt10-gem",
-    "dirt2-pickaxe",
-    "dirt1-pickaxe",
-    "dirt1-bomb",
-    "dirt1-drill",
-    "dirt40",
-    "dirt30",
-    "dirt20",
-    "dirt15",
-    "dirt10",
-    "dirt5",
-    "dirt1",
-    "rock2",
-    "rock1",
+# ---------------------------------------------------------------------------
+# Priority tiers
+# ---------------------------------------------------------------------------
+# High-value cells are dug ANYWHERE on the board before progressing downward.
+# Progress cells (crystals, plain dirt, rocks) are dug deepest-first.
+_HIGH_VALUE = [
+    "chest", "dirt15-gem", "dirt10-gem",
+    "dirt2-pickaxe", "dirt1-pickaxe", "dirt1-bomb", "dirt1-drill",
 ]
-_CELL_TYPES = list(_PRIORITY)
+_PROGRESS = [
+    "dirt40", "dirt30", "dirt20", "dirt15", "dirt10", "dirt5",
+    "dirt1", "rock2", "rock1",
+]
+_ALL_TYPES = _HIGH_VALUE + _PROGRESS
+_RANK = {name: i for i, name in enumerate(_ALL_TYPES)}
+_HIGH_VALUE_SET = frozenset(_HIGH_VALUE)
+_ROCK_TYPES = frozenset(("rock1", "rock2"))
 
 _RESOURCE_KEYS = ("zero-pickaxes", "zero-bombs", "zero-drills")
-
 _UI_KEYS = (
     "buy-pickaxe", "buy-button", "cancel-buy", "no-buy-button",
-    "set-max-buy", "use-bomb", "use-drill", "level",
+    "set-max-buy", "use-bomb", "use-drill",
 )
 
 
 def _load_optional(path):
     try:
         return load_template(path)
-    except (FileNotFoundError, ValueError) as e:
-        log(f"NOTE: Eternal Lode ref '{path.name}' could not be loaded ({e})")
+    except (FileNotFoundError, ValueError):
         return None
 
 
 class EternalLodeMacro:
     def __init__(self, adb_client: ADBClient):
         self.adb = adb_client
-        self.ref_scales = [config.REF_SCALE_BASELINE * config.CALIBRATED_SCALE]
 
         self.cell_templates = []
-        for name in _CELL_TYPES:
+        for name in _ALL_TYPES:
             tpl = _load_optional(config.ETERNAL_LODE_DIR / f"{name}.png")
             if tpl is not None:
                 self.cell_templates.append((name, tpl))
@@ -89,199 +82,330 @@ class EternalLodeMacro:
             if tpl is not None:
                 self.ui_refs[name] = tpl
 
-        self.board_template = _load_optional(
-            config.ETERNAL_LODE_DIR / "8x6-fullboard.png")
-
-        # Calibrated board geometry in phone-pixel space.
-        self.board_x = None
-        self.board_y = None
-        self.board_w = None
-        self.board_h = None
-        self.cell_w  = None
-        self.cell_h  = None
-
-        self.buy_failed = False
+        # Board geometry (set by _update_geometry on first good detection).
+        self.board_left = None
+        self.cell_w = None
+        self.line_y = None
+        self.device_scale = None
         self.calibrated = False
 
+        # Pre-scaled templates, built once after calibration.
+        self._scaled_cells = None    # [(name, resized_bgr), ...]
+        self._ui_scales = None       # [scale_float, ...]
+
+        self.buy_failed = False
+
     # ------------------------------------------------------------------
-    # Input
+    # Geometry
+    # ------------------------------------------------------------------
+
+    def _detect_green_line(self, image):
+        """Find the green depth-frontier line.
+
+        Returns (line_y, left_x, right_x) or None. The triangle marker and
+        depth text on the left are trimmed so left_x aligns with column 0.
+        """
+        h, w = image.shape[:2]
+        b = image[:, :, 0].astype(np.int16)
+        g = image[:, :, 1].astype(np.int16)
+        r = image[:, :, 2].astype(np.int16)
+        green = ((g > config.EL_LINE_MIN_GREEN)
+                 & (g - r > config.EL_LINE_MIN_DELTA)
+                 & (g - b > config.EL_LINE_MIN_DELTA))
+
+        rowcnt = green.sum(axis=1)
+        y_lo = int(config.EL_LINE_SEARCH_TOP * h)
+        y_hi = int(config.EL_LINE_SEARCH_BOT * h)
+        search = rowcnt.copy()
+        search[:y_lo] = 0
+        search[y_hi:] = 0
+        peak_y = int(search.argmax())
+        peak_cnt = int(search[peak_y])
+        if peak_cnt < config.EL_LINE_MIN_PIXELS * w:
+            return None
+
+        band = [y for y in range(max(0, peak_y - 12), min(h, peak_y + 13))
+                if rowcnt[y] > peak_cnt * 0.5]
+        if not band:
+            return None
+        line_y = int(round(sum(band) / len(band)))
+
+        sub = green[band[0]:band[-1] + 1, :]
+        colcnt = sub.sum(axis=0)
+        need = max(1, int(0.5 * len(band)))
+        cols = np.where(colcnt >= need)[0]
+        if cols.size == 0:
+            return None
+        left_raw, right = int(cols.min()), int(cols.max())
+        if (right - left_raw) < config.EL_LINE_MIN_SPAN * w:
+            return None
+
+        # Trim the triangle marker and depth text off the left: they are
+        # taller vertically than the thin line itself.
+        win_top = max(0, line_y - 30)
+        win_bot = min(h, line_y + 30)
+        heightcol = green[win_top:win_bot, :].sum(axis=0)
+        left = left_raw
+        while left < right and heightcol[left] > config.EL_TRIANGLE_MAX_THICK:
+            left += 1
+        # Small extra buffer to clear any residual marker pixels.
+        left = min(left + 2, right)
+
+        return line_y, left, right
+
+    def _update_geometry(self, image):
+        """Detect the green line and (re)derive board geometry.
+
+        Returns True if the board is visible this frame, else False.
+        """
+        det = self._detect_green_line(image)
+        if det is None:
+            return False
+        line_y, left, right = det
+        self.board_left = left
+        self.cell_w = (right - left) / config.EL_BOARD_COLS
+        self.line_y = line_y
+
+        if not self.calibrated:
+            self.device_scale = self.cell_w / config.EL_TEMPLATE_CELL_PX
+            self._prescale_templates()
+            self.calibrated = True
+            log(f"Eternal Lode: calibrated -- left={left}, "
+                f"cell~{self.cell_w:.0f}px, scale={self.device_scale:.2f}")
+        return True
+
+    def _prescale_templates(self):
+        """Pre-resize every cell template to the device scale (with a small
+        sweep) so the per-cell matching loop avoids all cv2.resize calls.
+        """
+        self._scaled_cells = []
+        s = self.device_scale
+        for name, tpl in self.cell_templates:
+            th, tw = tpl.shape[:2]
+            nw, nh = max(1, int(round(tw * s))), max(1, int(round(th * s)))
+            interp = cv2.INTER_AREA if nw < tw else cv2.INTER_LINEAR
+            self._scaled_cells.append((name, cv2.resize(tpl, (nw, nh),
+                                                        interpolation=interp)))
+        # Fast-mode subset: only templates needed to decide the action
+        # (chest needs special handling, rocks need bomb/drill).
+        _FAST_TYPES = frozenset(("chest", "rock1", "rock2"))
+        self._scaled_cells_fast = [(n, t) for n, t in self._scaled_cells
+                                   if n in _FAST_TYPES]
+        self._ui_scales = [round(self.device_scale * f, 4)
+                           for f in (0.82, 0.91, 1.0, 1.09, 1.18)]
+
+    # ------------------------------------------------------------------
+    # Scanning
+    # ------------------------------------------------------------------
+
+    def _scan_board(self, image, max_rows=None, fast=False):
+        """Scan visible cells using brightness as the primary filter.
+
+        max_rows: if set, only scan this many rows from the bottom.
+        fast: if True, use the reduced template set (chest/rock only).
+
+        Returns (diggable, empties) where:
+          diggable = [(col, row_offset, type_name), ...]
+          empties  = {(col, row_offset), ...}
+        """
+        h_img, w_img = image.shape[:2]
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        board_top = config.EL_BOARD_TOP_FRAC * h_img
+        inset = config.EL_CELL_INSET
+
+        diggable = []
+        empties = set()
+
+        row_start = 0
+        row_end = -config.EL_BOARD_ROWS
+        if max_rows is not None:
+            row_end = max(-config.EL_BOARD_ROWS, -max_rows)
+
+        for ro in range(row_start, row_end, -1):
+            top_y = self.line_y + ro * self.cell_w
+            if top_y < board_top:
+                break
+            for col in range(config.EL_BOARD_COLS):
+                x0 = int(self.board_left + col * self.cell_w + self.cell_w * inset)
+                x1 = int(self.board_left + (col + 1) * self.cell_w - self.cell_w * inset)
+                y0 = int(self.line_y + ro * self.cell_w + self.cell_w * inset)
+                y1 = int(self.line_y + (ro + 1) * self.cell_w - self.cell_w * inset)
+                x0, y0 = max(0, x0), max(0, y0)
+                x1, y1 = min(w_img, x1), min(h_img, y1)
+                if x1 - x0 < 4 or y1 - y0 < 4:
+                    continue
+
+                cell_gray = gray[y0:y1, x0:x1]
+                avg = float(cell_gray.mean())
+
+                if avg > config.EL_BRIGHT_THRESHOLD:
+                    name = self._classify_cell(image, col, ro, fast=fast)
+                    if name is not None:
+                        diggable.append((col, ro, name))
+                elif avg < config.EL_EMPTY_BRIGHT_MAX:
+                    std = float(cell_gray.std())
+                    if std < config.EL_EMPTY_STD_MAX:
+                        empties.add((col, ro))
+
+        return diggable, empties
+
+    def _classify_cell(self, image, col, row_offset, fast=False):
+        """Template-match a diggable cell against pre-scaled templates.
+
+        fast=True uses a reduced set (chest/rock only) for speed.
+        Returns the best-matching type name, or None if nothing exceeds
+        the confidence threshold.
+        """
+        pad = 0.15
+        cw = self.cell_w
+        x0 = int(self.board_left + col * cw - cw * pad)
+        y0 = int(self.line_y + row_offset * cw - cw * pad)
+        x1 = int(self.board_left + (col + 1) * cw + cw * pad)
+        y1 = int(self.line_y + (row_offset + 1) * cw + cw * pad)
+        h_img, w_img = image.shape[:2]
+        x0, y0 = max(0, x0), max(0, y0)
+        x1, y1 = min(w_img, x1), min(h_img, y1)
+        crop = image[y0:y1, x0:x1]
+        if crop.shape[0] < 8 or crop.shape[1] < 8:
+            return None
+
+        templates = self._scaled_cells_fast if fast else self._scaled_cells
+        best_name, best_conf = None, -1.0
+        for name, tpl in templates:
+            if tpl.shape[0] > crop.shape[0] or tpl.shape[1] > crop.shape[1]:
+                continue
+            res = cv2.matchTemplate(crop, tpl, cv2.TM_CCOEFF_NORMED)
+            conf = float(res.max())
+            if conf > best_conf:
+                best_conf = conf
+                best_name = name
+            if conf > 0.90:
+                break
+        if fast and best_conf < config.EL_CELL_THRESHOLD:
+            return "dirt1"
+        return best_name if best_conf >= config.EL_CELL_THRESHOLD else None
+
+    # ------------------------------------------------------------------
+    # Target selection
+    # ------------------------------------------------------------------
+
+    def _pick_target(self, diggable):
+        """Pick the best target.
+
+        High-value cells (chest, gems, tools) are prioritised by value
+        regardless of position. Progress cells (crystals, plain dirt, rocks)
+        are dug deepest-first (row_offset closest to 0) to advance the board.
+        """
+        if not diggable:
+            return None
+        high = [t for t in diggable if t[2] in _HIGH_VALUE_SET]
+        if high:
+            return min(high, key=lambda t: (_RANK[t[2]], -t[1], t[0]))
+        return min(diggable, key=lambda t: (-t[1], _RANK[t[2]], t[0]))
+
+    # ------------------------------------------------------------------
+    # Input helpers
     # ------------------------------------------------------------------
 
     def _tap(self, x, y, label):
-        """Send a tap with jitter and a random pre-delay."""
         jx = x + random.randint(-config.CLICK_JITTER, config.CLICK_JITTER)
         jy = y + random.randint(-config.CLICK_JITTER, config.CLICK_JITTER)
         log(f"  tap {label} @ ({jx}, {jy})")
         time.sleep(random.uniform(*config.CLICK_DELAY_RANGE))
         self.adb.tap(jx, jy)
 
-    # ------------------------------------------------------------------
-    # Coordinate helpers  (phone-pixel space throughout)
-    # ------------------------------------------------------------------
+    def _cell_center(self, col, row_offset):
+        cx = int(round(self.board_left + (col + 0.5) * self.cell_w))
+        cy = int(round(self.line_y + (row_offset + 0.5) * self.cell_w))
+        return cx, cy
 
-    def _cell_center(self, col, row):
-        """Centre of cell (col, row) in phone-pixel coords."""
-        if self.cell_w is None:
-            return None
-        cx = self.board_x + (col + 0.5) * self.cell_w
-        cy = self.board_y + (row + 0.5) * self.cell_h
-        return (int(round(cx)), int(round(cy)))
+    def _tap_cell(self, col, row_offset, label):
+        cx, cy = self._cell_center(col, row_offset)
+        self._tap(cx, cy, label)
 
-    def _cell_box(self, col, row, pad=0.10):
-        """Crop box for cell (col, row) in phone-pixel coords."""
-        if self.cell_w is None:
-            return None
-        mx = self.cell_w * pad
-        my = self.cell_h * pad
-        bx0 = self.board_x + col * self.cell_w - mx
-        by0 = self.board_y + row * self.cell_h - my
-        bx1 = self.board_x + (col + 1) * self.cell_w + mx
-        by1 = self.board_y + (row + 1) * self.cell_h + my
-        return (int(bx0), int(by0), int(bx1), int(by1))
+    def _dismiss_popup(self):
+        """Tap the pickaxe-count area (bottom-center, inactive) to dismiss
+        any reward overlay that might be covering the board."""
+        res = getattr(config, "PHONE_RESOLUTION", [1080, 2400])
+        w, h = res[0], res[1]
+        self._tap(int(w * 0.50), int(h * 0.965), "dismiss popup")
 
     # ------------------------------------------------------------------
-    # Calibration
+    # UI / resource matching
     # ------------------------------------------------------------------
 
-    def _calibrate_board(self, image):
-        if self.board_template is None:
-            log("Eternal Lode: 8x6-fullboard reference missing, cannot "
-                "calibrate board, aborting")
-            return False
+    def _match_ui(self, image, name, band=None):
+        """Match a UI reference image. Returns (conf, (x, y)) or (conf, None).
 
-        log("Eternal Lode: calibrating board position...")
-        conf, center, size = multi_scale_match(
-            image, self.board_template, self.ref_scales, 0.5)
-        if center is not None and size is not None and conf >= 0.45:
-            w, h = size
-            self.board_w = w
-            self.board_h = h
-            self.board_x = center[0] - w // 2
-            self.board_y = center[1] - h // 2
-            self.cell_w  = self.board_w / config.EL_BOARD_COLS
-            self.cell_h  = self.board_h / config.EL_BOARD_ROWS
-            log(f"  board matched (conf {conf:.2f}) at ({self.board_x},"
-                f" {self.board_y}), size {w}x{h}, "
-                f"cell ~{self.cell_w:.1f}x{self.cell_h:.1f}px")
-            return True
-
-        log(f"  board match too weak (conf {conf:.2f}); "
-            f"falling back to scale-derived size")
-        img_h, img_w = image.shape[:2]
-        scale = config.CALIBRATED_SCALE
-        w = int(round(config.EL_BOARD_W * scale))
-        h = int(round(config.EL_BOARD_H * scale))
-        self.board_w = w
-        self.board_h = h
-        self.board_x = max(0, (img_w - w) // 2)
-        self.board_y = max(0, (img_h - h) // 2)
-        self.cell_w  = self.board_w / config.EL_BOARD_COLS
-        self.cell_h  = self.board_h / config.EL_BOARD_ROWS
-        log(f"  fallback board at ({self.board_x}, {self.board_y}), "
-            f"size {w}x{h}, cell ~{self.cell_w:.1f}x{self.cell_h:.1f}px")
-        return True
-
-    def _find_primary_row(self, image):
-        tpl = self.ui_refs.get("level")
-        if tpl is None:
-            log("Eternal Lode: level marker reference missing")
-            return None
-        conf, center, _ = multi_scale_match(image, tpl, self.ref_scales)
-        if center is None or conf < config.EL_UI_THRESHOLD:
-            log(f"  level marker not found (best conf {conf:.2f})")
-            return None
-        marker_y = center[1]
-        row_top_relative = marker_y - self.board_y
-        if self.cell_h <= 0:
-            return None
-        row = int(round(row_top_relative / self.cell_h))
-        return max(0, min(config.EL_BOARD_ROWS - 1, row))
-
-    # ------------------------------------------------------------------
-    # Scanning
-    # ------------------------------------------------------------------
-
-    def _classify_cell(self, image, col, row):
-        box = self._cell_box(col, row)
-        if box is None:
-            return None
-        x0, y0, x1, y1 = box
-        img_h, img_w = image.shape[:2]
-        x0 = max(0, x0); y0 = max(0, y0)
-        x1 = min(img_w, x1); y1 = min(img_h, y1)
-        if x1 - x0 < 4 or y1 - y0 < 4:
-            return None
-        crop = image[y0:y1, x0:x1]
-        if is_blank(crop):
-            return None
-        best_name = None
-        best_conf = -1.0
-        for name, tpl in self.cell_templates:
-            conf, _, _ = multi_scale_match(crop, tpl, self.ref_scales)
-            if conf > best_conf:
-                best_conf = conf
-                best_name = name
-        return best_name if best_conf >= config.EL_CELL_THRESHOLD else None
-
-    def _scan_primary_row(self, image, row):
-        out = []
-        for col in range(config.EL_BOARD_COLS):
-            kind = self._classify_cell(image, col, row)
-            if kind is not None:
-                out.append((col, kind))
-        return out
-
-    def _pick_target(self, cells):
-        if not cells:
-            return None
-        rank = {name: i for i, name in enumerate(_PRIORITY)}
-        unknown = len(_PRIORITY)
-        cells_sorted = sorted(cells,
-                              key=lambda ct: (rank.get(ct[1], unknown), ct[0]))
-        return cells_sorted[0]
-
-    # ------------------------------------------------------------------
-    # Resources
-    # ------------------------------------------------------------------
-
-    def _check_resource(self, image, name):
-        tpl = self.resource_refs.get(name)
-        if tpl is None:
-            return False
-        conf, _, _ = multi_scale_match(image, tpl, self.ref_scales)
-        return conf >= config.EL_UI_THRESHOLD
-
-    def _find_ui(self, image, name):
-        """Match a UI ref; return (conf, (x, y)) or (conf, None)."""
+        `band` is an optional (y_frac_top, y_frac_bot) to restrict the search.
+        """
         tpl = self.ui_refs.get(name)
         if tpl is None:
             return -1.0, None
-        conf, center, _ = multi_scale_match(image, tpl, self.ref_scales)
-        if conf < config.EL_UI_THRESHOLD or center is None:
+
+        y_off = 0
+        search = image
+        if band is not None:
+            h_img = image.shape[0]
+            yt = max(0, int(band[0] * h_img))
+            yb = min(h_img, int(band[1] * h_img))
+            if yb <= yt:
+                return -1.0, None
+            search = image[yt:yb]
+            y_off = yt
+
+        from matcher import multi_scale_match
+        conf, center, _ = multi_scale_match(search, tpl, self._ui_scales)
+        if center is None:
             return conf, None
-        return conf, center   # already phone-pixel coords
+        cx, cy = center[0], center[1] + y_off
+        return conf, (cx, cy)
+
+    def _find_ui(self, image, name, band=None):
+        """Match a UI element; return (x, y) if above threshold, else None."""
+        conf, pos = self._match_ui(image, name, band=band)
+        if pos is not None and conf >= config.EL_UI_THRESHOLD:
+            return pos
+        return None
+
+    def _check_resource_zero(self, image, name):
+        """True if a resource badge reads zero."""
+        tpl = self.resource_refs.get(name)
+        if tpl is None:
+            return False
+        from matcher import multi_scale_match
+        conf, center, _ = multi_scale_match(
+            image, tpl, self._ui_scales)
+        return conf >= config.EL_ZERO_THRESHOLD
+
+    def _check_resources(self, image):
+        """Return dict of resource-zero flags, restricted to the toolbar band."""
+        h_img = image.shape[0]
+        yt = int(config.EL_TOOLBAR_BAND[0] * h_img)
+        yb = int(config.EL_TOOLBAR_BAND[1] * h_img)
+        toolbar = image[yt:yb]
+        return {name: self._check_resource_zero(toolbar, name)
+                for name in _RESOURCE_KEYS}
 
     # ------------------------------------------------------------------
     # Buy flow
     # ------------------------------------------------------------------
 
-    def _attempt_buy_pickaxes(self):
+    def _try_buy_pickaxes(self):
         log("Eternal Lode: out of pickaxes, attempting to buy")
         image = self.adb.screenshot()
-        conf, pos = self._find_ui(image, "buy-pickaxe")
+        pos = self._find_ui(image, "buy-pickaxe")
         if pos is None:
-            log(f"  buy-pickaxe button not found (conf {conf:.2f}); "
-                f"marking buy as failed for this session")
+            log("  buy-pickaxe not found; marking buy failed")
             self.buy_failed = True
             return
         self._tap(*pos, "buy-pickaxe")
         time.sleep(rand_delay(config.EL_ACTION_DELAY))
 
         image = self.adb.screenshot()
-        conf, pos = self._find_ui(image, "set-max-buy")
+        pos = self._find_ui(image, "set-max-buy")
         if pos is None:
-            log(f"  set-max-buy button not found (conf {conf:.2f}); "
-                f"cancelling and marking buy as failed")
+            log("  set-max-buy not found; cancelling")
             self._cancel_buy()
             self.buy_failed = True
             return
@@ -289,179 +413,194 @@ class EternalLodeMacro:
         time.sleep(rand_delay(config.EL_ACTION_DELAY))
 
         image = self.adb.screenshot()
-        nbconf, nbpos = self._find_ui(image, "no-buy-button")
-        if nbpos is not None:
-            log(f"  no-buy-button showing (conf {nbconf:.2f}), "
-                f"can't afford; cancelling")
+        if self._find_ui(image, "no-buy-button") is not None:
+            log("  can't afford pickaxes; cancelling")
             self._cancel_buy()
             self.buy_failed = True
             return
 
-        bconf, bpos = self._find_ui(image, "buy-button")
-        if bpos is None:
-            log(f"  buy-button not found (conf {bconf:.2f}); "
-                f"cancelling and marking buy as failed")
+        pos = self._find_ui(image, "buy-button")
+        if pos is None:
+            log("  buy-button not found; cancelling")
             self._cancel_buy()
             self.buy_failed = True
             return
-        self._tap(*bpos, "buy-button")
+        self._tap(*pos, "buy-button")
         log("  pickaxe purchase confirmed")
         time.sleep(rand_delay(config.EL_ACTION_DELAY))
 
     def _cancel_buy(self):
         image = self.adb.screenshot()
-        cconf, cpos = self._find_ui(image, "cancel-buy")
-        if cpos is not None:
-            self._tap(*cpos, "cancel-buy")
+        pos = self._find_ui(image, "cancel-buy")
+        if pos is not None:
+            self._tap(*pos, "cancel-buy")
             time.sleep(rand_delay(config.EL_ACTION_DELAY))
-        else:
-            log(f"  cancel-buy not found (conf {cconf:.2f}); "
-                f"hoping the menu auto-dismisses")
 
     # ------------------------------------------------------------------
-    # Tool usage
+    # Actions
     # ------------------------------------------------------------------
 
-    def _use_pickaxe(self, col, row, kind):
-        cr = self._cell_center(col, row)
-        if cr is None:
-            return
-        self._tap(*cr, f"pickaxe -> {kind} at ({col},{row})")
+    def _use_pickaxe(self, col, row_offset, kind):
+        self._tap_cell(col, row_offset,
+                       f"pickaxe -> {kind} c{col} r{row_offset:+d}")
 
-    def _use_bomb_or_drill(self, tool, col, row, kind):
+    def _use_bomb_or_drill(self, tool, col, row_offset, kind, empties):
+        """Activate bomb/drill and place it in the empty cell above the target.
+
+        Returns True if the placement was attempted, False if the tool button
+        wasn't found or the cell above isn't empty.
+        """
+        if (col, row_offset - 1) not in empties:
+            return False
         image = self.adb.screenshot()
-        conf, pos = self._find_ui(image, tool)
+        pos = self._find_ui(image, tool, band=config.EL_TOOLBAR_BAND)
         if pos is None:
-            log(f"  {tool} button not found (conf {conf:.2f}), skipping")
             return False
         self._tap(*pos, tool)
         time.sleep(rand_delay(config.EL_ACTION_DELAY))
-        above_row = row - 1
-        if above_row < 0:
-            log(f"  cannot place {tool} above row {row} (off the top), aborting")
-            return False
-        cr = self._cell_center(col, above_row)
-        if cr is None:
-            return False
-        self._tap(*cr, f"{tool} at ({col},{above_row}) for {kind} at ({col},{row})")
+        self._tap_cell(col, row_offset - 1,
+                       f"{tool} above c{col} r{row_offset - 1:+d}")
         return True
 
-    def _handle_chest(self, col, row, stop_event):
-        cr = self._cell_center(col, row)
-        if cr is None:
-            return
-        log(f"Eternal Lode: chest at ({col},{row}), tapping up to "
-            f"{config.EL_CHEST_MAX_CLICKS} times")
-        for i in range(config.EL_CHEST_MAX_CLICKS):
+    def _handle_chest(self, col, row_offset, stop_event):
+        duration = config.EL_CHEST_SPAM_SECS
+        delay = config.EL_CHEST_TAP_DELAY
+        log(f"Eternal Lode: chest at c{col} r{row_offset:+d}, "
+            f"spam-tapping for {duration:.1f}s")
+        deadline = time.monotonic() + duration
+        taps = 0
+        while time.monotonic() < deadline:
             if stop_event is not None and stop_event.is_set():
                 return
-            self._tap(*cr, f"chest tap {i + 1}")
-            _interruptible_sleep(rand_delay(config.EL_CHEST_CLICK_DELAY), stop_event)
-            image = self.adb.screenshot()
-            kind = self._classify_cell(image, col, row)
-            if kind != "chest":
-                log(f"  chest cleared after {i + 1} tap(s)")
-                return
-        log(f"  chest still present after {config.EL_CHEST_MAX_CLICKS} taps, moving on")
+            self._tap_cell(col, row_offset, f"chest tap {taps + 1}")
+            taps += 1
+            _interruptible_sleep(delay, stop_event)
+        log(f"  chest spam done ({taps} taps)")
+        self._dismiss_popup()
 
-    def _act_on(self, col, row, kind, resources, stop_event):
-        zero_pick  = resources.get("zero-pickaxes", False)
-        zero_bomb  = resources.get("zero-bombs",    False)
-        zero_drill = resources.get("zero-drills",   False)
+    def _act_on(self, col, row_offset, kind, resources, empties, stop_event):
+        zero_pick = resources.get("zero-pickaxes", False)
+        zero_bomb = resources.get("zero-bombs", False)
+        zero_drill = resources.get("zero-drills", False)
 
         if kind == "chest":
-            self._handle_chest(col, row, stop_event)
+            self._handle_chest(col, row_offset, stop_event)
             return
 
-        if kind in ("rock1", "rock2"):
+        if kind in _ROCK_TYPES:
             if not zero_bomb:
-                self._use_bomb_or_drill("use-bomb", col, row, kind)
-                return
+                if self._use_bomb_or_drill("use-bomb", col, row_offset,
+                                           kind, empties):
+                    return
             if not zero_drill:
-                self._use_bomb_or_drill("use-drill", col, row, kind)
-                return
+                if self._use_bomb_or_drill("use-drill", col, row_offset,
+                                           kind, empties):
+                    return
             if not zero_pick:
-                self._use_pickaxe(col, row, kind)
+                self._use_pickaxe(col, row_offset, kind)
                 if kind == "rock1":
                     time.sleep(rand_delay(config.EL_ACTION_DELAY))
-                    self._use_pickaxe(col, row, "rock1 (2nd hit)")
+                    self._use_pickaxe(col, row_offset, "rock1 2nd hit")
                 return
-            log(f"  no tools for {kind} at ({col},{row}), skipping")
+            log(f"  no tools for {kind} at c{col}, skipping")
             return
 
-        # Dirt of any kind.
+        # Any dirt variant.
         if not zero_pick:
-            self._use_pickaxe(col, row, kind)
+            self._use_pickaxe(col, row_offset, kind)
             return
         if not zero_bomb:
-            self._use_bomb_or_drill("use-bomb", col, row, kind)
-            return
+            if self._use_bomb_or_drill("use-bomb", col, row_offset,
+                                       kind, empties):
+                return
         if not zero_drill:
-            self._use_bomb_or_drill("use-drill", col, row, kind)
-            return
-        log(f"  no tools for {kind} at ({col},{row}), skipping")
+            if self._use_bomb_or_drill("use-drill", col, row_offset,
+                                       kind, empties):
+                return
+        log(f"  no tools for {kind} at c{col}, skipping")
 
     # ------------------------------------------------------------------
     # One iteration
     # ------------------------------------------------------------------
 
     def step(self, stop_event=None):
-        """Run one iteration.  Returns a status string.
-        Raises ADBError on unrecoverable device failure."""
+        """Run one macro iteration. Returns a status string.
+
+        Raises ADBError on unrecoverable device failure.
+        """
         image = self.adb.screenshot()
-        if is_blank(image):
+        if image is None or float(np.asarray(image).std()) < 8.0:
             return "blank"
 
-        if not self.calibrated:
-            if not self._calibrate_board(image):
-                return "stop"
-            self.calibrated = True
+        if not self._update_geometry(image):
+            # Board not visible; might be a popup. Tap to dismiss.
+            self._dismiss_popup()
+            _interruptible_sleep(rand_delay(config.EL_ACTION_DELAY),
+                                 stop_event)
+            return "no-board"
 
-        resources = {name: self._check_resource(image, name)
-                     for name in _RESOURCE_KEYS}
-        zero_pick  = resources["zero-pickaxes"]
-        zero_bomb  = resources["zero-bombs"]
+        if self._scaled_cells is None:
+            return "no-board"
+
+        resources = self._check_resources(image)
+        zero_pick = resources["zero-pickaxes"]
+        zero_bomb = resources["zero-bombs"]
         zero_drill = resources["zero-drills"]
+
         if zero_pick and zero_bomb and zero_drill:
-            log("Eternal Lode: out of pickaxes, bombs, AND drills; stopping")
+            log("Eternal Lode: all resources empty; stopping")
             return "stop"
         if zero_pick and not self.buy_failed:
-            self._attempt_buy_pickaxes()
+            self._try_buy_pickaxes()
             return "acted"
 
-        row = self._find_primary_row(image)
-        if row is None:
-            return "no-row"
+        fast = config.EL_FAST_MODE
 
-        cells = self._scan_primary_row(image, row)
-        if not cells:
-            log(f"Eternal Lode: primary row {row} has no active cells")
-            return "no-cells"
-        log(f"Eternal Lode: primary row {row} cells = "
-            + ", ".join(f"{c}:{k}" for c, k in cells))
-        target = self._pick_target(cells)
-        if target is None:
-            return "no-cells"
-        col, kind = target
-        log(f"  -> target ({col},{row}) is {kind}")
+        if fast:
+            diggable, empties = self._scan_board(image, max_rows=2, fast=True)
+            if not diggable:
+                diggable, empties = self._scan_board(image, fast=True)
+        else:
+            diggable, empties = self._scan_board(image)
 
-        self._act_on(col, row, kind, resources, stop_event)
+        if not diggable:
+            return "no-cells"
+
+        if fast:
+            target = max(diggable, key=lambda t: (t[1], -t[0]))
+        else:
+            target = self._pick_target(diggable)
+        col, row_offset, kind = target
+
+        log(f"Eternal Lode{' [fast]' if fast else ''}: "
+            f"{len(diggable)} diggable -- "
+            + ", ".join(f"c{c}r{r:+d}:{k}" for c, r, k in
+                        sorted(diggable, key=lambda t: (-t[1], t[0]))))
+        log(f"  -> target c{col} r{row_offset:+d} = {kind}")
+
+        self._act_on(col, row_offset, kind, resources, empties, stop_event)
         time.sleep(rand_delay(config.EL_ACTION_DELAY))
+
+        # Dismiss any reward popup that appeared (bombs, drills, etc.).
+        self._dismiss_popup()
         return "acted"
 
 
+# ======================================================================
+# Entry point
+# ======================================================================
+
 def run_eternal_lode(stop_event=None):
-    """Run the Eternal Lode macro until stopped, timed out, or the failsafe."""
+    """Run the Eternal Lode macro until stopped or timed out."""
     import threading
-    from main import _active_adb
 
     if stop_event is None:
         stop_event = threading.Event()
 
     log("Eternal Lode mode")
 
-    # Connect to ADB device.
     try:
+        choose_server_port()
         adb_client = ADBClient()
         if config.ADB_DEVICE:
             adb_client.connect(config.ADB_DEVICE)
@@ -481,8 +620,6 @@ def run_eternal_lode(stop_event=None):
         config.PHONE_RESOLUTION = [w, h]
     except ADBError as e:
         log(f"WARNING: could not query resolution: {e}")
-
-    _start_failsafe_listener(stop_event)
 
     try:
         macro = EternalLodeMacro(adb_client)
@@ -504,9 +641,9 @@ def run_eternal_lode(stop_event=None):
     else:
         log("running with no timeout")
 
-    timed_out   = False
+    timed_out = False
     self_stopped = False
-    last_quiet  = None
+    last_quiet = None
     try:
         while True:
             if stop_event.is_set():
@@ -528,15 +665,15 @@ def run_eternal_lode(stop_event=None):
                 self_stopped = True
                 break
 
-            if state in ("no-row", "no-cells", "blank"):
+            if state in ("no-board", "no-cells", "blank"):
                 if state != last_quiet:
                     if state == "blank":
-                        log("WARNING: ADB screencap is blank -- make sure "
-                            "the device screen is on")
-                    elif state == "no-row":
-                        log("Eternal Lode: waiting for level marker...")
+                        log("WARNING: ADB screencap is blank")
+                    elif state == "no-board":
+                        log("Eternal Lode: board not visible (popup?), "
+                            "will retry")
                     else:
-                        log("Eternal Lode: primary row idle, waiting")
+                        log("Eternal Lode: no diggable cells, waiting")
                 last_quiet = state
             else:
                 last_quiet = None

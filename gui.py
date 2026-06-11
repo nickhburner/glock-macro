@@ -21,7 +21,7 @@ import capture
 import config
 import eternal_lode
 import main
-from adb import ADBClient, ADBError, find_adb, list_devices
+from adb import ADBClient, ADBError, find_adb, list_devices, choose_server_port
 from matcher import (
     list_skill_files,
     skill_hash,
@@ -101,7 +101,8 @@ _GM_ID_TO_NAME = {gid: name for gid, name in _GAME_MODES}
 _GM_NAMES = [name for _, name in _GAME_MODES]
 
 # Keys rendered on the main view (timeout card), skipped in the settings panel.
-_MAIN_VIEW_KEYS = {"RUN_TIMEOUT_HOURS", "CLOSE_ON_TIMEOUT", "SLEEP_PHONE_ON_TIMEOUT"}
+_MAIN_VIEW_KEYS = {"RUN_TIMEOUT_HOURS", "STUCK_TIMEOUT_MINUTES",
+                    "CLOSE_ON_TIMEOUT", "SLEEP_PHONE_ON_TIMEOUT"}
 
 
 # Settings form schema. Each entry is one of:
@@ -120,11 +121,18 @@ SETTINGS_SCHEMA = [
     ("STARTUP_DELAY", "Startup delay", "float", "seconds",
      "Grace period after pressing Start before the first screen check. "
      "With ADB the game window no longer needs to be focused."),
+    ("SKILL_SETTLE_DELAY", "Skill settle delay", "float", "seconds",
+     "After a skill-selection screen is detected, wait this long and re-grab "
+     "before reading the cards, so a fast poll doesn't scan before the cards "
+     "and Refresh button finish animating in. 0.1-0.2s is plenty; 0 disables."),
 
     ("section", "Run timeout"),
     ("RUN_TIMEOUT_HOURS", "Run timeout", "float", "hours",
      "Stop the macro automatically after this long. Set to 0 to disable the "
      "timeout and run until stopped manually."),
+    ("STUCK_TIMEOUT_MINUTES", "Stuck timeout", "float", "min",
+     "Stop the macro if it keeps repeating the same action (e.g. tapping a "
+     "button that won't dismiss) for this long. Set to 0 to disable."),
     ("CLOSE_ON_TIMEOUT", "Close game window on timeout", "bool", "",
      "When the timeout fires, also close the game window, the BlueStacks "
      "emulator (and its background services) or the scrcpy mirror window."),
@@ -611,7 +619,6 @@ class App:
 
         main.set_log_sink(self._log_queue.put)
         root.protocol("WM_DELETE_WINDOW", self._on_close)
-        root.bind("<Escape>", lambda e: self._stop())
         root.bind("<Configure>", self._on_configure)
         self.root.after(120, self._drain_log)
 
@@ -864,11 +871,15 @@ class App:
             fg=self.theme["fg_dim"])
         self._plant_dpad.pack(anchor="w", pady=(4, 4))
 
-        # Hints for modes without options
-        self._gm_eternal_hint = tk.Label(
-            self._gm_disclosure, foreground=self.theme["fg_muted"],
-            bg=self.theme["surface"], font=(ui_font(), 9),
-            text="No extra options; Eternal Lode runs on auto.")
+        # Eternal Lode sub-frame
+        self._gm_eternal_frame = tk.Frame(
+            self._gm_disclosure, bg=self.theme["surface"])
+        self._el_fast_var = tk.BooleanVar(value=config.EL_FAST_MODE)
+        self._el_fast_cb = ttk.Checkbutton(
+            self._gm_eternal_frame, text="Fast Mode",
+            variable=self._el_fast_var,
+            command=self._on_el_fast_toggle)
+        self._el_fast_cb.pack(anchor="w", pady=(4, 2))
         self._gm_jungle_hint = tk.Label(
             self._gm_disclosure, foreground=self.theme["fg_muted"],
             bg=self.theme["surface"], font=(ui_font(), 9),
@@ -895,7 +906,7 @@ class App:
     def _update_game_mode_disclosure(self):
         """Show/hide the mode-specific sub-options."""
         for w in (self._gm_chapter_frame, self._gm_plant_frame,
-                  self._gm_eternal_hint, self._gm_jungle_hint):
+                  self._gm_eternal_frame, self._gm_jungle_hint):
             w.pack_forget()
         gm = self._game_mode_id()
         if gm == "chapter":
@@ -905,11 +916,15 @@ class App:
         elif gm == "plant":
             self._gm_plant_frame.pack(fill="x")
         elif gm == "eternal":
-            self._gm_eternal_hint.pack(anchor="w", pady=4)
+            self._gm_eternal_frame.pack(fill="x")
         elif gm == "jungle":
             self._gm_jungle_hint.pack(anchor="w", pady=4)
 
     def _on_chapter_move(self):
+        self._schedule_autosave()
+
+    def _on_el_fast_toggle(self):
+        config.EL_FAST_MODE = self._el_fast_var.get()
         self._schedule_autosave()
 
     def _on_plant_dir(self):
@@ -939,6 +954,20 @@ class App:
         Tooltip(row, "Stop the macro automatically after this long. "
                      "Set to 0 to disable.")
 
+        row_stuck = tk.Frame(frame, bg=self.theme["surface"],
+                             highlightthickness=0)
+        row_stuck.pack(fill="x", pady=(2, 4))
+        tk.Label(row_stuck, text="Stuck after", bg=self.theme["surface"],
+                 fg=self.theme["fg_dim"],
+                 font=(ui_font(), 9)).pack(side="left")
+        ttk.Entry(row_stuck, textvariable=self.vars["STUCK_TIMEOUT_MINUTES"][0],
+                  width=6).pack(side="left", padx=(6, 4))
+        tk.Label(row_stuck, text="min", bg=self.theme["surface"],
+                 fg=self.theme["fg_muted"],
+                 font=(ui_font(), 9)).pack(side="left")
+        Tooltip(row_stuck, "Stop the macro if it keeps repeating the same "
+                           "action for this long. Set to 0 to disable.")
+
         self._timeout_cb1 = RoundedCheckbox(
             frame, text="Close game window on timeout",
             variable=self.vars["CLOSE_ON_TIMEOUT"],
@@ -966,6 +995,10 @@ class App:
         self._adb_label_to_serial = {}
         try:
             adb_exe = find_adb(config.ADB_PATH)
+            # Pick the right adb server port (isolated to dodge the BlueStacks
+            # version war, or shared if something else owns the device) BEFORE
+            # listing, so the dropdown and the pre-warmed stream use that server.
+            choose_server_port(adb_exe)
             devices = list_devices(adb_exe)
         except Exception as e:
             self._update_adb_status(f"adb not found: {e}", ok=False)
@@ -983,17 +1016,34 @@ class App:
         except tk.TclError:
             return
 
-        # Restore the previously configured device if it is still present.
+        # Restore the previously configured device if it is still present;
+        # otherwise auto-select a lone device (or clear). Crucially, keep
+        # config.ADB_DEVICE in lockstep with what the dropdown shows: setting the
+        # StringVar does NOT fire the combobox-selected handler, so without this
+        # an auto-selected device leaves config.ADB_DEVICE pointing at a stale,
+        # now-absent serial -- and the macro then fails to connect ("Device ...
+        # not found") even though Test Connection (which reads the dropdown) works.
         configured = config.ADB_DEVICE
+        chosen_serial = None  # None = leave config untouched (user must pick)
         for label, serial in self._adb_label_to_serial.items():
             if serial == configured:
                 self.adb_device_var.set(label)
+                chosen_serial = serial
                 break
         else:
             if len(labels) == 1:
                 self.adb_device_var.set(labels[0])
+                chosen_serial = self._adb_label_to_serial.get(labels[0], "")
             elif not labels:
+                # No devices right now: blank the dropdown but KEEP the saved
+                # serial, so a transient unplug/refresh doesn't forget the device
+                # (it re-matches above when it reconnects).
                 self.adb_device_var.set("")
+            # multiple devices, none configured: leave the selection to the user;
+            # _on_adb_device_selected updates config when they pick.
+        if chosen_serial is not None and chosen_serial != config.ADB_DEVICE:
+            config.ADB_DEVICE = chosen_serial
+            self._schedule_autosave()
 
         count = len(devices)
         self._update_adb_status(
@@ -2693,6 +2743,7 @@ class App:
             ("POLL_INTERVAL", "Poll interval", "seconds"),
             ("ACTION_DELAY", "Action delay", "seconds"),
             ("STARTUP_DELAY", "Startup delay", "seconds"),
+            ("SKILL_SETTLE_DELAY", "Skill settle delay", "seconds"),
         ])
         # Humanisation
         self._sp_group(body, "Humanisation",
@@ -3143,6 +3194,9 @@ class App:
         self.chapter_move_var.set(
             "timed" if config.MOVEMENT_MODE == 1 else "dontmove")
 
+        # Eternal Lode options
+        self._el_fast_var.set(config.EL_FAST_MODE)
+
         # Plant direction
         self.plant_dir_var.set(config.MOVEMENT_PLANT_PRESET)
 
@@ -3194,6 +3248,7 @@ class App:
         gm = self._game_mode_id()
         out["GAME_MODE"] = gm
         out["ETERNAL_LODE_MODE"] = (gm == "eternal")
+        out["EL_FAST_MODE"] = bool(self._el_fast_var.get())
 
         if gm == "chapter":
             out["MOVEMENT_MODE"] = (
@@ -3681,7 +3736,7 @@ class App:
             self._topbar_sep.pack(fill="x")
             self._body.pack(fill="both", expand=True,
                             padx=10, pady=(6, 10))
-            self.root.title("A2 Macro Controller")
+            self.root.title(f"A2 Macro Controller v{config.VERSION}")
             self.root.minsize(1180, 620)
             if hasattr(self, "_saved_geometry"):
                 self.root.geometry(self._saved_geometry)
@@ -3806,7 +3861,7 @@ class _Splash:
 
 def main_gui():
     root = tk.Tk()
-    root.title("A2 Macro Controller")
+    root.title(f"A2 Macro Controller v{config.VERSION}")
     root.geometry("1280x720")
     root.minsize(1180, 620)
     root.withdraw()                       # stay hidden until fully built

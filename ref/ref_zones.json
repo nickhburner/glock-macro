@@ -22,8 +22,19 @@
   "ad-start.png": "bottom",
   "start_challenge.png": "bottom",
   "challenge-has-ended3.png": "top",
+  "challenge-has-ended4.png": "top",
   "continue.png": "bottom",
   "get-ready.png": "bottom",
   "plant.png": "middle",
-  "test.png": "middle"
+  "test.png": "middle",
+  "guild.png": "bottom",
+  "guild-hall.png": "middle",
+  "suknom.png": "top",
+  "like-profile.png": "middle",
+  "camp.png": "bottom",
+  "message-board.png": "middle",
+  "camp-like.png": "middle",
+  "leave-camp.png": "bottom",
+  "guild-desc.png": "top",
+  "self-like.png": "top"
 }

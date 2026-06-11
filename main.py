@@ -20,7 +20,7 @@ from typing import Optional
 
 import capture
 import config
-from adb import ADBClient, ADBError, BlackFrameError
+from adb import ADBClient, ADBError, BlackFrameError, choose_server_port
 from matcher import (
     crop_band,
     is_blank,
@@ -33,14 +33,6 @@ from matcher import (
 
 # Keeps subprocess helpers from flashing a console window in --windowed builds.
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-
-# Optional pynput for the global Esc failsafe.
-try:
-    from pynput import keyboard as _pynput_kb
-    _PYNPUT_AVAILABLE = True
-except ImportError:
-    _pynput_kb = None
-    _PYNPUT_AVAILABLE = False
 
 # Module-level reference to the active ADB client.  Set by run_macro() /
 # run_eternal_lode() so sleep_phone() (imported by eternal_lode.py) works.
@@ -111,33 +103,6 @@ def _interruptible_sleep(seconds, stop_event):
         stop_event.wait(seconds)
     else:
         time.sleep(seconds)
-
-
-# ------------------------------------------------------------------
-# Failsafe
-# ------------------------------------------------------------------
-
-def _start_failsafe_listener(stop_event):
-    """Spawn a daemon pynput listener that sets stop_event on global Esc.
-
-    Returns the listener (or None if pynput is unavailable).  The macro loop
-    still checks stop_event each iteration, so the listener just sets the
-    event; the loop performs the clean shutdown.
-    """
-    if not _PYNPUT_AVAILABLE:
-        log("pynput not installed -- global Esc failsafe unavailable. "
-            "Use the Stop button or Ctrl+C to stop the macro.")
-        return None
-
-    def on_press(key):
-        if key == _pynput_kb.Key.esc:
-            log("fail-safe: Esc pressed globally, stopping")
-            stop_event.set()
-            return False  # stop listener
-
-    listener = _pynput_kb.Listener(on_press=on_press, daemon=True)
-    listener.start()
-    return listener
 
 
 # ------------------------------------------------------------------
@@ -728,6 +693,16 @@ class Macro:
         if iconf >= config.REF_THRESHOLD:
             if self._move_armed:
                 self._move_in_skill = True      # a skill screen is up
+            # The cards and the Refresh button animate in after the banner shows.
+            # With a fast poll we can catch the banner before they finish, then
+            # see no skill / no Refresh and wrongly fall back to a slot.  Wait a
+            # beat and RE-GRAB so we scan the settled screen, not the half-drawn
+            # one.  (Skipped when SKILL_SETTLE_DELAY is 0.)
+            if config.SKILL_SETTLE_DELAY > 0:
+                time.sleep(config.SKILL_SETTLE_DELAY)
+                image, self._norm = resize_to_width(self._grab(), self.match_width)
+                h, w = image.shape[:2]
+                band, _first_slot, _second_slot, _ = config.geometry_for(w, h)
             category, name, sconf, scenter = self._find_best_skill(image, band)
             if name:
                 log(f"skill select [{indicator} {iconf:.2f}] -> "
@@ -925,7 +900,7 @@ def run_plant_movement(adb_client, spawn=1, on_log=None):
 # ------------------------------------------------------------------
 
 def run_macro(stop_event=None):
-    """Run the macro until stopped, timed out, or the Esc failsafe fires.
+    """Run the macro until stopped or timed out.
 
     `stop_event` is a threading.Event; pass None for headless use (one is
     created internally).  Config is read here, so the GUI applies settings
@@ -940,8 +915,13 @@ def run_macro(stop_event=None):
     log("active skill categories: "
         + (", ".join(config.ACTIVE_CATEGORIES) or "(none)"))
 
-    # Connect to ADB device.
+    # Connect to ADB device.  Choose the adb server port first: an isolated port
+    # dodges the BlueStacks "version war" (its old HD-Adb fights the modern adb
+    # and drops USB phones from `adb devices`); it self-heals to the shared
+    # server if something else already owns the device.
     try:
+        port = choose_server_port()
+        log(f"adb server: {'isolated port ' + str(port) if port else 'system default port'}")
         adb_client = ADBClient()
         if config.ADB_DEVICE:
             adb_client.connect(config.ADB_DEVICE)
@@ -1005,8 +985,6 @@ def run_macro(stop_event=None):
         log("capture: screencap mode (USE_STREAM_CAPTURE is off) -- slower, "
             "and black on BlueStacks during gameplay")
 
-    _start_failsafe_listener(stop_event)
-
     try:
         macro = Macro(adb_client, stream=stream)
     except (FileNotFoundError, ValueError) as e:
@@ -1016,7 +994,7 @@ def run_macro(stop_event=None):
         return
 
     log(f"ADB ready, starting in {config.STARTUP_DELAY:.0f}s "
-        f"(press Esc or the Stop button to stop)")
+        f"(press the Stop button to stop)")
     _interruptible_sleep(config.STARTUP_DELAY, stop_event)
     if stop_event.is_set():
         log("stopped before the run started")
@@ -1030,9 +1008,13 @@ def run_macro(stop_event=None):
         log("running with no timeout")
 
     timed_out = False
+    stuck_out = False
     last_state = None
     consec_black = 0
     BLACK_GIVE_UP = 40   # stop only after a long unbroken run of black frames
+    stuck_state = None
+    stuck_since = None
+    stuck_timeout = (config.STUCK_TIMEOUT_MINUTES or 0) * 60
     try:
         while True:
             if stop_event.is_set():
@@ -1046,6 +1028,21 @@ def run_macro(stop_event=None):
             try:
                 state = macro.step()
                 consec_black = 0
+
+                if stuck_timeout and state not in ("idle", "blank"):
+                    now = time.monotonic()
+                    if state == stuck_state:
+                        if now - stuck_since >= stuck_timeout:
+                            log(f"stuck timeout: '{state}' has repeated for "
+                                f"{config.STUCK_TIMEOUT_MINUTES:g} min, stopping")
+                            stuck_out = True
+                            break
+                    else:
+                        stuck_state = state
+                        stuck_since = now
+                else:
+                    stuck_state = None
+                    stuck_since = None
             except BlackFrameError:
                 # All-black capture: keep polling, it usually recovers. Do NOT
                 # treat as a disconnect (the connection is fine).
@@ -1084,7 +1081,7 @@ def run_macro(stop_event=None):
     if stream is not None:
         stream.stop()
 
-    if timed_out:
+    if timed_out or stuck_out:
         if config.SLEEP_PHONE_ON_TIMEOUT:
             adb_client.sleep_phone()
         if config.CLOSE_ON_TIMEOUT:

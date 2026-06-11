@@ -2,6 +2,11 @@ import json
 import sys
 from pathlib import Path
 
+# App version, baked into each build. The updater compares the GitHub release
+# tag against version.txt (written by build.bat), NOT this constant; this one
+# is for the main app to display. Bump both before tagging a release.
+VERSION = "2.1.0"
+
 # Paths
 if getattr(sys, "frozen", False):
     BASE_DIR = Path(sys.executable).resolve().parent
@@ -228,8 +233,16 @@ POLL_INTERVAL = 1       # seconds between screen checks
 ACTION_DELAY  = 1.2     # pause after a tap so the screen can settle
 STARTUP_DELAY = 2.0     # grace period before the first poll
 
+# After a skill-selection screen is first detected, wait this long and re-grab
+# the frame before scanning the cards.  The cards and the Refresh button animate
+# in, so a fast poll can scan too early and miss them -- defaulting to the first
+# slot, or not realising Refresh is available.  0.1-0.2s covers the animation;
+# set to 0 to disable.
+SKILL_SETTLE_DELAY = 0.15
+
 # ------------------------------------------------------------------ Run timeout
 RUN_TIMEOUT_HOURS      = 2
+STUCK_TIMEOUT_MINUTES  = 5
 CLOSE_ON_TIMEOUT       = True
 SLEEP_PHONE_ON_TIMEOUT = True
 
@@ -242,6 +255,29 @@ CLOSE_PROCESSES = [
 
 # adb binary; overridden by auto-detection in adb.find_adb().
 ADB_PATH = "adb"
+
+# adb SERVER port for this app. BlueStacks ships its own adb (HD-Adb.exe, an old
+# 1.0.36) which, when BlueStacks has run, leaves a 1.0.36 server on the shared
+# default port 5037. The modern SDK adb the macro uses then detects the version
+# mismatch and kills+restarts that server on every command -- the "version war"
+# -- and during the restart a USB phone briefly drops out of `adb devices`, so
+# connect() fails with "Device ... not found". Giving this app its OWN server
+# port isolates it from BlueStacks's 5037 server so the two never fight.
+#
+# This is safe for BlueStacks targets: emulators are reached with an explicit
+# `adb connect 127.0.0.1:<port>` over TCP, which works from any local server.
+# Set to 5037 (or 0/None) to share the system server instead (the old behaviour).
+ADB_SERVER_PORT = 5038
+
+
+def apply_adb_server_port():
+    """Pin every adb subprocess this process spawns to ADB_SERVER_PORT via the
+    ANDROID_ADB_SERVER_PORT env var (adb reads it; subprocesses inherit os.environ
+    so capture.py's screenrecord uses the same server). Falsy = leave the
+    environment alone (system default 5037)."""
+    import os
+    if ADB_SERVER_PORT:
+        os.environ["ANDROID_ADB_SERVER_PORT"] = str(ADB_SERVER_PORT)
 
 # ------------------------------------------------------------------ Humanisation
 CLICK_JITTER      = 6
@@ -337,29 +373,57 @@ def plant_movement(spawn: int):
 ETERNAL_LODE_DIR  = REF_DIR / "Eternal Lode"
 EL_BOARD_COLS     = 6
 EL_BOARD_ROWS     = 8
-EL_BOARD_W        = 484
+EL_BOARD_W        = 484          # legacy: BlueStacks-scale board px (reference only)
 EL_BOARD_H        = 656
-EL_CELL_THRESHOLD = 0.72
+
+# Board geometry is anchored to the bright-green "depth frontier" line each
+# iteration. The line gives board left/right and cell width; cell_w yields a
+# device_scale that pre-scales every Eternal Lode template once.
+EL_TEMPLATE_CELL_PX = 75.0       # native cell template size the refs were cut at
+EL_LINE_MIN_GREEN   = 220        # depth line is near-pure green (G); timer bar is ~180
+EL_LINE_MIN_DELTA   = 90         # G must exceed R and B by this much
+EL_LINE_SEARCH_TOP  = 0.30       # search band for the line (fraction of height)
+EL_LINE_SEARCH_BOT  = 0.95
+EL_LINE_MIN_PIXELS  = 0.25       # min green px on the line row, as a fraction of width
+EL_LINE_MIN_SPAN    = 0.40       # min horizontal span of the line, fraction of width
+EL_TRIANGLE_MAX_THICK = 12       # green px taller than this at a column => triangle, trim it
+
+# Brightness-based cell classification. The game renders diggable cells at full
+# brightness and hidden (non-diggable) cells dimmed. Validated separation:
+#   diggable ~110-127, hidden ~75-81, empty ~72 (stddev ~1).
+EL_BRIGHT_THRESHOLD = 95         # avg brightness above this = diggable
+EL_EMPTY_BRIGHT_MAX = 75         # avg brightness below this + low stddev = empty
+EL_EMPTY_STD_MAX    = 3.0        # stddev below this (with low brightness) = empty
+EL_CELL_INSET       = 0.15       # fractional inset for brightness crop (avoids grid lines)
+
+EL_CELL_THRESHOLD = 0.60         # template match confidence for cell classification
 EL_UI_THRESHOLD   = 0.78
+EL_ZERO_THRESHOLD = 0.93         # resource zero-detection (whole-button matching)
+EL_TOOLBAR_BAND   = (0.82, 1.0)  # bottom strip where tool/resource buttons live
+
+EL_BOARD_TOP_FRAC = 0.42         # upper y-guard (fraction of screen) so scans stay on the board
+
+EL_FAST_MODE         = False       # scan bottom 2 rows first, dig lowest cell only
 EL_ACTION_DELAY      = 0.5
-EL_CHEST_CLICK_DELAY = 0.3
-EL_CHEST_MAX_CLICKS  = 20
+EL_CHEST_SPAM_SECS   = 2.0        # spam-tap chests for this long (no scan between taps)
+EL_CHEST_TAP_DELAY   = 0.3       # delay between spam taps
 
 # ------------------------------------------------------------------ Settings persistence
 SETTINGS_PATH = BASE_DIR / "settings.json"
 
 PERSISTED_KEYS = (
-    "POLL_INTERVAL", "ACTION_DELAY", "STARTUP_DELAY",
-    "RUN_TIMEOUT_HOURS", "CLOSE_ON_TIMEOUT", "SLEEP_PHONE_ON_TIMEOUT",
+    "POLL_INTERVAL", "ACTION_DELAY", "STARTUP_DELAY", "SKILL_SETTLE_DELAY",
+    "RUN_TIMEOUT_HOURS", "STUCK_TIMEOUT_MINUTES",
+    "CLOSE_ON_TIMEOUT", "SLEEP_PHONE_ON_TIMEOUT",
     "MATCH_THRESHOLD", "REF_THRESHOLD", "SKILL_DOWNSCALE", "REF_DOWNSCALE",
-    "CALIBRATED_SCALE", "ADB_DEVICE", "PHONE_RESOLUTION",
+    "CALIBRATED_SCALE", "ADB_DEVICE", "PHONE_RESOLUTION", "ADB_SERVER_PORT",
     "CLICK_JITTER", "DELAY_JITTER",
     "FIRST_SKILL_SLOT", "SECOND_SKILL_SLOT", "GAME_OVER_TAP",
     "SKILL_MATCH_BAND",
     "ACTIVE_CATEGORIES", "CUSTOM_PRIORITY_SKILLS", "AVOID_SKILLS",
     "USE_STREAM_CAPTURE",
     "AUTOSAVE", "DARK_MODE", "KEEP_AWAKE", "HOTKEY",
-    "ETERNAL_LODE_MODE", "GAME_MODE",
+    "ETERNAL_LODE_MODE", "GAME_MODE", "EL_FAST_MODE",
     "MOVEMENT_MODE", "MOVEMENT_CHAPTER", "MOVEMENT_PLANT_PRESET", "MOVEMENT_PLANT_T",
     "MOVEMENT_CUSTOM",
     "MOVEMENT_JOYSTICK_X_RATIO", "MOVEMENT_JOYSTICK_Y_RATIO",
@@ -415,3 +479,4 @@ def save_settings(path=None):
 
 
 load_settings()
+apply_adb_server_port()
