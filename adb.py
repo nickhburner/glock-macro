@@ -86,6 +86,95 @@ def _sdk_adb_candidates() -> list:
     return cands
 
 
+def _bluestacks_install_dirs() -> list:
+    """BlueStacks install folders from the registry. Every edition
+    (BlueStacks_nxt, BlueStacks_msi2, plain BlueStacks 4, ...) writes an
+    InstallDir value under HKLM\\SOFTWARE\\<edition>, so enumerate every key
+    whose name starts with "BlueStacks" in both registry views. This finds
+    installs on any drive and in custom folders."""
+    dirs = []
+    try:
+        import winreg
+    except ImportError:
+        return dirs
+    for view in (winreg.KEY_WOW64_64KEY, winreg.KEY_WOW64_32KEY):
+        try:
+            software = winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE, "SOFTWARE", 0,
+                winreg.KEY_READ | view)
+        except OSError:
+            continue
+        with software:
+            i = 0
+            while True:
+                try:
+                    name = winreg.EnumKey(software, i)
+                except OSError:
+                    break
+                i += 1
+                if not name.lower().startswith("bluestacks"):
+                    continue
+                try:
+                    with winreg.OpenKey(software, name, 0,
+                                        winreg.KEY_READ | view) as key:
+                        val, _ = winreg.QueryValueEx(key, "InstallDir")
+                except OSError:
+                    continue
+                if val:
+                    dirs.append(Path(val))
+    return dirs
+
+
+def _fixed_drive_roots() -> list:
+    """Roots of all fixed drives (skips removable/network drives, which can
+    stall on access). Falls back to C: if the WinAPI call fails."""
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        bitmask = kernel32.GetLogicalDrives()
+        roots = []
+        for i in range(26):
+            if not bitmask & (1 << i):
+                continue
+            root = f"{chr(65 + i)}:\\"
+            if kernel32.GetDriveTypeW(root) == 3:  # DRIVE_FIXED
+                roots.append(Path(root))
+        return roots or [Path("C:\\")]
+    except Exception:
+        return [Path("C:\\")]
+
+
+def _bluestacks_adb_candidates() -> list:
+    """Possible HD-Adb.exe locations across BlueStacks editions, custom
+    install folders, and non-C: drives. Registry InstallDir first (it is
+    authoritative); then glob BlueStacks* under the usual parent folders on
+    every fixed drive, which catches installs whose registry entry is
+    missing. The glob also reproduces the old hardcoded C: defaults."""
+    cands = [d / "HD-Adb.exe" for d in _bluestacks_install_dirs()]
+
+    parents = []
+    for root in _fixed_drive_roots():
+        parents += [root / "Program Files",
+                    root / "Program Files (x86)",
+                    root / "ProgramData",
+                    root]  # custom installs often sit at the drive root
+    for parent in parents:
+        try:
+            for d in parent.glob("BlueStacks*"):
+                cands.append(d / "HD-Adb.exe")
+        except OSError:
+            pass
+
+    seen = set()
+    out = []
+    for p in cands:
+        key = str(p).lower()
+        if key not in seen:
+            seen.add(key)
+            out.append(p)
+    return out
+
+
 def find_adb(config_path: str = "adb") -> str:
     """
     Locate the adb binary. Search order (modern adb first, on purpose):
@@ -93,7 +182,8 @@ def find_adb(config_path: str = "adb") -> str:
       2. Android SDK platform-tools adb.exe
       3. System PATH
       4. Next to a running scrcpy.exe (scrcpy bundles adb.exe)
-      5. BlueStacks's HD-Adb.exe  (LAST: it is adb 1.0.36, which kills and
+      5. BlueStacks's HD-Adb.exe, located via registry InstallDir plus folder
+         globs on every fixed drive  (LAST: it is adb 1.0.36, which kills and
          restarts newer adb servers -- the "version war" that makes the
          emulator go offline and `wm size` return empty. Only fall back to it
          when no modern adb exists.)
@@ -145,13 +235,7 @@ def find_adb(config_path: str = "adb") -> str:
         pass
 
     # 5. BlueStacks HD-Adb.exe (last resort -- see docstring)
-    bs_candidates = [
-        Path(r"C:\Program Files\BlueStacks_nxt\HD-Adb.exe"),
-        Path(r"C:\Program Files (x86)\BlueStacks\HD-Adb.exe"),
-        Path(r"C:\ProgramData\BlueStacks\HD-Adb.exe"),
-        Path(r"C:\ProgramData\BlueStacks_nxt\HD-Adb.exe"),
-    ]
-    for p in bs_candidates:
+    for p in _bluestacks_adb_candidates():
         if p.is_file():
             log.debug("adb found (BlueStacks HD-Adb -- old 1.0.36): %s", p)
             return str(p)

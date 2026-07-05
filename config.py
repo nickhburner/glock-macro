@@ -5,7 +5,7 @@ from pathlib import Path
 # App version, baked into each build. The updater compares the GitHub release
 # tag against version.txt (written by build.bat), NOT this constant; this one
 # is for the main app to display. Bump both before tagging a release.
-VERSION = "2.2.0"
+VERSION = "2.2.1"
 
 # Paths
 if getattr(sys, "frozen", False):
