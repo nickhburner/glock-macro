@@ -24,11 +24,9 @@ echo Version: %VERSION%
 
 echo.
 echo === Building the .exe ===
-python -m PyInstaller --noconfirm --onefile --windowed --name "A2 Macro Controller" ^
-    --hidden-import pynput.keyboard._win32 ^
-    --hidden-import pynput.mouse._win32 ^
-    --collect-all av ^
-    gui.py
+rem Built from the checked-in spec (same flags as the old CLI call, plus the
+rem cv2 FFmpeg-DLL size trim -- see the comment inside the spec).
+python -m PyInstaller --noconfirm "A2 Macro Controller.spec"
 if errorlevel 1 goto fail
 
 echo.
@@ -40,8 +38,15 @@ if errorlevel 1 goto fail
 
 echo.
 echo === Bundling image folders next to the .exe ===
+rem Wipe the copied folders first: xcopy never deletes, so refs removed from
+rem the repo would otherwise linger in dist/ and ship forever.
+if exist "dist\skills" rmdir /S /Q "dist\skills"
+if exist "dist\ref" rmdir /S /Q "dist\ref"
 xcopy /E /I /Y skills "dist\skills" >nul
 xcopy /E /I /Y ref "dist\ref" >nul
+rem Custom button captures are per-machine user data: ship the folder empty.
+if exist "dist\ref\custom" rmdir /S /Q "dist\ref\custom"
+mkdir "dist\ref\custom"
 copy /Y version.txt "dist\version.txt" >nul
 if exist README.md copy /Y README.md "dist\README.md" >nul
 if exist settings.example.json copy /Y settings.example.json "dist\settings.json" >nul

@@ -5,7 +5,7 @@ from pathlib import Path
 # App version, baked into each build. The updater compares the GitHub release
 # tag against version.txt (written by build.bat), NOT this constant; this one
 # is for the main app to display. Bump both before tagging a release.
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 
 # Paths
 if getattr(sys, "frozen", False):
@@ -285,17 +285,16 @@ CLICK_DELAY_RANGE = (0.05, 0.25)
 DELAY_JITTER      = 0.35
 
 # ------------------------------------------------------------------ Reference images
-REF_PLAY            = REF_DIR / "play_button.png"
-REF_DEVIL           = REF_DIR / "devil_reject.png"
-REF_GAME_OVER       = REF_DIR / "game_over.png"
-REF_VALKYRIE        = REF_DIR / "valkyrie.png"
-REF_LEVEL           = REF_DIR / "level.png"
-REF_GLORY           = REF_DIR / "glory.png"
-REF_ANGEL           = REF_DIR / "angel.png"
-REF_REFRESH         = REF_DIR / "refresh.png"
-REF_GET_READY       = REF_DIR / "get-ready.png"
-REF_CONTINUE        = REF_DIR / "continue.png"
-REF_START_CHALLENGE = REF_DIR / "start_challenge.png"
+# Refs the skill-selection flow needs by name (loaded into Macro.refs).  All
+# other buttons are loaded by filename via Macro._load_group, so adding a new
+# tap-on-sight button needs no constant here.
+REF_PLAY     = REF_DIR / "play_button.png"
+REF_DEVIL    = REF_DIR / "devil_reject.png"
+REF_VALKYRIE = REF_DIR / "valkyrie.png"
+REF_LEVEL    = REF_DIR / "level.png"
+REF_GLORY    = REF_DIR / "glory.png"
+REF_ANGEL    = REF_DIR / "angel.png"
+REF_REFRESH  = REF_DIR / "refresh.png"
 
 # ------------------------------------------------------------------ Capture
 # Capture frames from a continuous Android screenrecord H.264 stream instead of
@@ -408,6 +407,210 @@ EL_ACTION_DELAY      = 0.5
 EL_CHEST_SPAM_SECS   = 2.0        # spam-tap chests for this long (no scan between taps)
 EL_CHEST_TAP_DELAY   = 0.3       # delay between spam taps
 
+# ------------------------------------------------------------------ All-Star Cup
+# A speed-optimised mode for the All-Star Cup event.  Each level presents three
+# boss-selection sets (in place of the usual skill picks); within one event a
+# boss appears in at most one of a level's sets.  The macro scans the three
+# card slots, identifies which bosses are showing, and selects the visible one
+# with the LOWEST death-animation duration (fastest to despawn = fastest run).
+# The per-level pools below are the usual line-ups, but they DRIFT slightly
+# between events (a color variant from another level's row can swap in), so by
+# default every boss template is scanned, not just the level's 9.
+#
+# Templates live in ref/all_star/bosses/<name>.png: each boss icon flattened on
+# black and pre-scaled to how it renders on screen at ALL_STAR_CALIB_WIDTH
+# (built by ALL STAR/make_boss_templates.py).  The slot positions, the 0.9
+# render scale, and the match threshold were all measured from in-game example
+# screenshots (see ALL STAR/ in the repo).
+ALL_STAR_DIR       = REF_DIR / "all_star"
+ALL_STAR_BOSS_DIR  = ALL_STAR_DIR / "bosses"
+ALL_STAR_CHALLENGE = ALL_STAR_DIR / "challenge.png"
+
+# Which level to play: 1..7, or the string "elim" for the Elimination mode
+# (see ALL_STAR_ELIM_BOSSES).  Set by the GUI dropdown.
+ALL_STAR_LEVEL = 1
+
+# One-time GUI warning that All-Star mode only works on rooted BlueStacks.
+# Set to True after the popup has been shown once, so it never nags again.
+ALL_STAR_ROOT_WARNED = False
+
+# Per-level boss pools: name -> death-animation duration in seconds (lower is
+# better; only the relative order matters).  From ALL STAR/allstarbossdata.csv.
+# Each name maps to ref/all_star/bosses/<name>.png; pool entries whose template
+# is missing are logged at start and simply cannot be identified or picked.
+ALL_STAR_LEVELS = {
+    1: {
+        "purple-whirl": 0.05,   "red-whirl": 0.067,       "green-whirl": 0.083,
+        "red-flower": 0.55,     "purple-flower": 0.633,   "orange-flower": 0.683,
+        "purple-witch": 1.55,   "blue-witch": 1.617,      "orange-pot-witch": 1.717,
+    },
+    2: {
+        "blue-book": 0.067,     "red-dragon": 0.517,      "purple-dragon": 0.55,
+        "blue-dragon": 0.65,    "orange-pumpkin": 0.683,  "red-slime": 0.933,
+        "yellow-cyc-mage": 1.05, "red-ghost-lantern": 1.65, "purple-ghost-lantern": 1.717,
+    },
+    3: {
+        "green-snake": 0.633,   "red-golem": 0.683,       "grey-golem": 0.7,
+        "green-golem": 0.8,     "green-cyc-mage": 0.883,  "red-cyc-mage": 0.983,
+        "purple-q-bee": 1.283,  "yellow-q-bee": 1.283,    "green-q-medusa": 1.683,
+    },
+    4: {
+        "reg-tomb-keeper": 0.567, "blue-archer": 0.8,     "tall-flame-mage": 1.083,
+        "red-q-bee": 1.35,      "purple-demon": 1.583,    "red-hog": 1.65,
+        "blue-hog": 1.683,      "yellow-demon": 1.717,    "red-demon": 1.717,
+    },
+    5: {
+        "purple-wingseed": 0.05, "orange-wingseed": 0.05, "sunflower": 0.05,
+        "purp-scythe": 0.65,    "green-yeti": 1.55,       "brown-hog": 1.567,
+        "purp-yeti": 1.667,     "blue-yeti": 1.683,       "blue-frost": 2.383,
+    },
+    6: {
+        "zomblet": 0.45,        "helix": 0.617,           "red-conch": 0.717,
+        "nyanja": 0.733,        "nian-beast": 0.733,      "alex": 0.733,
+        "seraph": 0.758,        "blue-conch": 0.883,      "phynx": 1.017,
+    },
+    7: {
+        "demon-bat": 0.567,     "ghost-bat": 0.658,       "otta": 0.75,
+        "dracoola": 0.833,      "lavashell-turt": 1.017,  "rolla": 1.167,
+        "ghost-mask": 1.55,     "ember-mage": 1.583,      "violet-cat": 1.65,
+    },
+}
+
+# Geometry was calibrated against screenshots this many px wide; the templates
+# and the slot ratios below are scaled to the live frame by (live_width / this).
+ALL_STAR_CALIB_WIDTH = 1080
+
+# The three card slots as a fraction of width, and their shared vertical centre
+# as a fraction of height.  Each slot is scanned in a box of +/- the half-size
+# ratios around its centre (the slot boxes do not overlap).
+#
+# The cards' VERTICAL position is not a fixed fraction of height across aspect
+# ratios: a taller screen (Pixel 1080x2410, ~0.448) centres them lower than a
+# shorter one (BlueStacks 540x960, ~0.5625), where the boss sits at ~0.456H not
+# 0.50H.  So the y-centre is set to 0.47 (between the two) and the box is made
+# tall enough (half-h 0.075) to fully contain the boss on BOTH: verified 21/21
+# bosses on the Pixel shots at 0.96-0.99 (unchanged) AND purple-whirl on a real
+# BlueStacks frame at 0.978 (was a total miss at the old 0.50/0.052).  The X
+# ratios are stable across aspect ratios (horizontal layout is width-symmetric).
+ALL_STAR_SLOT_X_RATIOS     = (0.210, 0.499, 0.790)
+ALL_STAR_SLOT_Y_RATIO      = 0.47
+ALL_STAR_SLOT_HALF_W_RATIO = 0.111      # 120/1080
+ALL_STAR_SLOT_HALF_H_RATIO = 0.075      # tall enough to cover the card-Y shift across aspect ratios
+
+# Confidence to accept a boss in a slot.  Measured self-match is ~0.96-0.99 and
+# the worst look-alike (purple vs red whirl, same shape) is ~0.81, so 0.85
+# separates cleanly while leaving margin for stream compression / animation.
+ALL_STAR_THRESHOLD = 0.85
+# Slot crops are matched at this fraction of resolution for speed: ~3x faster
+# (3ms vs 9ms per 3-slot frame) with colour preserved, so same-shape /
+# different-colour bosses (the whirls) still separate.
+ALL_STAR_SCAN_DOWNSCALE = 0.5
+
+# Challenge (start-the-level) button.
+ALL_STAR_CHALLENGE_THRESHOLD = 0.80
+ALL_STAR_START_TIMEOUT       = 5   # s to look for Challenge before assuming the level already started
+
+# Spam-tap target used to skip loading and clear intermediate screens: a spot
+# that is empty on both the loading screen and the boss-selection screen (well
+# below the cards), so the taps never select a card or trigger a button.
+ALL_STAR_TAP_X_RATIO  = 0.50
+ALL_STAR_TAP_Y_RATIO  = 0.85    # dead centre, low (below cards + countdown, on empty background)
+# Minimum extra delay between spam taps.  0 means tap as fast as the tapper
+# allows: the synchronous fast tap already self-paces at ~25ms each (it blocks
+# until the tap lands), so no artificial delay is needed and both the
+# loading-skip spam and the boss-select spam stay genuinely rapid (~40 taps/s).
+ALL_STAR_TAP_INTERVAL = 0.0
+
+ALL_STAR_SCAN_TIMEOUT   = 60.0        # s to wait for a set's bosses before giving up
+# Scan every boss template (all levels, 63) instead of only the current level's
+# 9-boss pool.  The pools drift slightly between events (a color variant from
+# another level's CSV row can swap in, which the pool-only scan cannot
+# identify), and the full scan proved fast enough live, so it is the default.
+# Turn off to scan only the level's pool (~13x cheaper while nothing matches).
+ALL_STAR_SCAN_ALL_BOSSES = True
+
+# --- Elim (Elimination) mode: ALL_STAR_LEVEL = "elim" --------------------------
+# Ten levels, each starting with the same 3-boss selection popup.  The user
+# pre-picks ONE boss per level in the GUI (thumbnails labelled with death-anim
+# seconds); each level's scan looks ONLY for that boss and taps it on sight.
+# A level with no pick falls back to scanning every template and taking the
+# fastest-dying visible boss.
+ALL_STAR_ELIM_SETS   = 10
+# Ordered picks for levels 1..10: boss template names ("" = no pick).  Set by
+# the GUI's Elim boss picker.
+ALL_STAR_ELIM_BOSSES = []
+# Seconds to keep spam-tapping the chosen slot after detection.  The boss is
+# detected the instant it appears (while still small), but the card does not
+# become selectable until it finishes growing/settling a moment later, so the
+# spam must last long enough to still be tapping when it becomes selectable.
+ALL_STAR_SELECT_BRIEF   = 0.5
+# After a boss is selected the PLAYER fights it (~10-20s) and the screen then
+# goes black to transition to the next set.  The macro waits out that fight for
+# the black screen WITHOUT tapping (the player is moving the character), up to
+# this long.  Must comfortably exceed the longest fight.
+ALL_STAR_BLACK_TIMEOUT  = 360
+ALL_STAR_BLACK_MEAN     = 12          # frame mean brightness below this = black transition between sets
+
+# --- 3rd-boss death detection: pause the instant its health bar empties --------
+# After the THIRD boss is selected the macro stops tapping and rapidly polls the
+# boss health bar (the long red bar at the top of the screen). It taps the pause
+# button ONCE the instant the bar empties on the KILL, then stops -- the user exits
+# manually for the time bonus.
+#
+# The 3rd part flow (per the user): the bar is EMPTY during the minions phase
+# (which can be long), then the boss spawns and the bar FILLS to full, stays full
+# briefly, then depletes to empty as the boss dies. Both the minions phase and the
+# death look "empty" by red-fraction, so the macro must ARM first (confirm the bar
+# filled = boss spawned) and only then treat empty as the kill. That is the
+# FULL_FRAC -> EMPTY_FRAC two-state guard below; it also covers the pre-fight
+# transition (no bar = reads empty). Detection = saturated-red fill fraction of the
+# bar crop: ~0.5-0.9 full, ~0.00-0.01 empty (measured on real BlueStacks + Pixel).
+ALL_STAR_PAUSE_ON_3RD_DEATH = True
+ALL_STAR_HP_FULL_FRAC     = 0.30   # red-frac confirming the bar filled = boss spawned (arms the watch)
+ALL_STAR_HP_EMPTY_FRAC    = 0.04   # red-frac at/below this (AFTER arming) = boss dead -> pause. Raise to pause earlier, lower to wait for a more-empty bar.
+ALL_STAR_HP_SPAWN_TIMEOUT = 300.0  # s to wait for the boss to spawn (bar to fill) through the minions phase; if it never fills, skip the auto-pause (do NOT risk a wrong pause)
+ALL_STAR_HP_DEATH_TIMEOUT = 180.0  # s to watch the spawned boss deplete to empty before giving up
+
+# The health bar and pause button sit at a different HEIGHT fraction on a tall
+# phone (Pixel, w/h ~0.448) than a short emulator (BlueStacks, ~0.5625) -- the same
+# aspect-ratio shift as the boss cards (see ALL_STAR_SLOT_Y_RATIO). So both are
+# keyed by aspect: w/h >= split uses the WIDE (BlueStacks) preset, else TALL (Pixel).
+# Bar crop = (x0, x1, y0, y1) ratios (cropped to EXACTLY the bar, excluding the
+# boss icon and the dark segment bar above it). Pause button = (x, y) ratios.
+# Measured from ALL STAR/Boss death detection/ screenshots.
+ALL_STAR_HP_ASPECT_SPLIT = 0.50
+ALL_STAR_HP_BAR_WIDE  = (0.27, 0.83, 0.106, 0.120)   # BlueStacks 540x960
+ALL_STAR_HP_BAR_TALL  = (0.28, 0.86, 0.153, 0.174)   # Pixel 1080x2410
+ALL_STAR_PAUSE_WIDE   = (0.069, 0.045)
+ALL_STAR_PAUSE_TALL   = (0.069, 0.108)
+
+
+def all_star_hp_geometry(w, h):
+    """Return (bar_region, pause_xy) ratio tuples for this frame's aspect ratio."""
+    wide = (w / max(1, h)) >= ALL_STAR_HP_ASPECT_SPLIT
+    bar = ALL_STAR_HP_BAR_WIDE if wide else ALL_STAR_HP_BAR_TALL
+    pause = ALL_STAR_PAUSE_WIDE if wide else ALL_STAR_PAUSE_TALL
+    return bar, pause
+
+# ------------------------------------------------------------------ Fast input
+# Low-latency tap injection (fastinput.FastTapper).  Instead of `adb shell input
+# tap` (~35ms each: boots app_process + opens a connection), feed `sendevent`
+# commands to one persistent `adb shell` (~20ms per tap, no connection or JVM
+# startup).  Used by the All-Star mode where tap latency is the dominant delay.
+# Needs a writable /dev/input node: true on rooted BlueStacks (SELinux Disabled +
+# shell in the `input` group) and rooted phones.  Falls back to `adb input tap`
+# automatically whenever the fast path cannot be set up.
+FAST_TAP_ENABLED   = True
+# Extra seconds to hold each touch down before releasing.  sendevent's own
+# spacing between the down and up calls already registers a tap on BlueStacks, so
+# 0 is fine; a positive value inserts an on-device `sleep` between down and up for
+# devices that need a longer press.
+FAST_TAP_HOLD      = 0.0
+# Screen-pixel to event-coordinate mapping.  "auto" picks "rotated" for
+# BlueStacks (portrait app on a landscape panel; a square normalised touch grid)
+# and "direct" otherwise.  Force "rotated" or "direct" to override.
+FAST_TAP_TRANSFORM = "auto"
+
 # ------------------------------------------------------------------ Settings persistence
 SETTINGS_PATH = BASE_DIR / "settings.json"
 
@@ -423,7 +626,10 @@ PERSISTED_KEYS = (
     "ACTIVE_CATEGORIES", "CUSTOM_PRIORITY_SKILLS", "AVOID_SKILLS",
     "USE_STREAM_CAPTURE",
     "AUTOSAVE", "DARK_MODE", "KEEP_AWAKE", "HOTKEY",
-    "ETERNAL_LODE_MODE", "GAME_MODE", "EL_FAST_MODE",
+    "ETERNAL_LODE_MODE", "GAME_MODE", "EL_FAST_MODE", "ALL_STAR_LEVEL",
+    "ALL_STAR_SCAN_ALL_BOSSES", "ALL_STAR_ELIM_BOSSES", "ALL_STAR_ROOT_WARNED",
+    "FAST_TAP_ENABLED", "FAST_TAP_HOLD", "FAST_TAP_TRANSFORM",
+    "ALL_STAR_PAUSE_ON_3RD_DEATH", "ALL_STAR_HP_FULL_FRAC", "ALL_STAR_HP_EMPTY_FRAC",
     "MOVEMENT_MODE", "MOVEMENT_CHAPTER", "MOVEMENT_PLANT_PRESET", "MOVEMENT_PLANT_T",
     "MOVEMENT_CUSTOM",
     "MOVEMENT_JOYSTICK_X_RATIO", "MOVEMENT_JOYSTICK_Y_RATIO",

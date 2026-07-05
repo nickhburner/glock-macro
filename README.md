@@ -41,11 +41,15 @@ That is it. Press **Start**.
 - **Smart skill selection.** Prioritise skill categories by drag order, pin
   specific must-have skills (Custom Priority), and blacklist skills to never
   take (Avoid list). Rerolls automatically when no wanted skill is showing.
-- **Multiple game modes:** Chapter, Plant Defense, Shackled Jungle, and Eternal
-  Lode, each with mode-specific options.
+- **Multiple game modes:** Chapter, Plant Defense, Shackled Jungle, Eternal
+  Lode, and All-Star Cup, each with mode-specific options. All-Star Cup ONLY
+  works on a rooted BlueStacks instance.
 - **Automatic movement.** Configurable per-mode joystick movement after the
   first skill selection: timed chapter run, or directional Plant Defense
   positioning (top/bottom/left/right, with automatic spawn-side detection).
+- **Plant Defense co-op helpers.** Gives your partner a like on the results
+  screen, and when hosting, taps the back button after every completed round
+  so the game's level auto-advance never moves you off your chosen level.
 - **Speed control.** Automatically cycles the in-game speed to max (3x) at the
   start of each match.
 - **Tap-on-sight buttons.** Built-in detection for Play, Continue, Get Ready,
@@ -63,15 +67,22 @@ That is it. Press **Start**.
 - **Humanised input.** Tap jitter and timing randomisation.
 - **Dark / light theme.**
 - **Autosave.** Settings persist to `settings.json` automatically or on demand.
-- **Global Esc failsafe.** Press Esc at any time (any window focused) to
-  instantly stop the macro.
+- **Global hotkey.** Press ``Ctrl+` `` at any time (any window focused) to
+  start or stop the macro. Rebind it via the Hotkey button.
+- **Auto-updates.** `A2 Updater.exe` fetches the latest release from GitHub.
 - **Standalone .exe.** No Python install needed for end users.
 
 ## Running it
 
 - Press **Start**. The status pill turns green (**Running**).
-- To stop: press **Stop**, or press **Esc** anywhere on your PC.
+- To stop: press **Stop**, or use the global hotkey (``Ctrl+` `` by default).
 - Your setup is remembered in `settings.json` next to the `.exe`.
+
+## Updating
+
+Run `A2 Updater.exe` (it sits next to the main exe). It checks GitHub for the
+latest release, downloads it, and applies it in place. Your `settings.json`,
+custom buttons, and match zones are never touched. Close the main app first.
 
 ## Good to know
 

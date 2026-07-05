@@ -17,6 +17,7 @@ from tkinter import messagebox, simpledialog, ttk
 
 from PIL import Image, ImageTk
 
+import all_star
 import capture
 import config
 import eternal_lode
@@ -95,6 +96,7 @@ _GAME_MODES = [
     ("eternal", "Eternal Lode"),
     ("plant",   "Plant Defense"),
     ("jungle",  "Shackled Jungle"),
+    ("allstar", "All-Star Cup"),
 ]
 _GM_NAME_TO_ID = {name: gid for gid, name in _GAME_MODES}
 _GM_ID_TO_NAME = {gid: name for gid, name in _GAME_MODES}
@@ -564,11 +566,15 @@ class App:
         self._status_pulse_after = None
         self._status_pulse_on = True
         self._picker_search_var = None   # search StringVar in skill picker
+        self._elim_picker = None         # Elim boss-pick Toplevel
+        self._elim_sel = 0               # level slot the next boss click fills
+        self._boss_thumb_cache = {}
 
         self.active = [c for c in config.ACTIVE_CATEGORIES
                        if c in config.SKILL_CATEGORIES]
         self.custom = list(config.CUSTOM_PRIORITY_SKILLS)
         self.avoid = list(config.AVOID_SKILLS)
+        self.elim_bosses = self._normalized_elim_picks()
 
         self.dark = bool(config.DARK_MODE)
         self.theme = _THEMES["dark" if self.dark else "light"]
@@ -885,6 +891,43 @@ class App:
             bg=self.theme["surface"], font=(ui_font(), 9),
             text="Movement is disabled automatically for Shackled Jungle.")
 
+        # All-Star Cup: level picker (1-7 or Elim).  Levels scan the 3 boss
+        # cards and pick the fastest-dying visible boss; Elim runs 10 levels
+        # against the user's per-level boss picks.
+        self._gm_allstar_frame = tk.Frame(self._gm_disclosure,
+                                           bg=self.theme["surface"],
+                                           highlightthickness=0)
+        tk.Label(self._gm_allstar_frame, text="Level",
+                 foreground=self.theme["fg_dim"], bg=self.theme["surface"],
+                 font=(ui_font(), 9)).pack(anchor="w", pady=(4, 0))
+        self.allstar_level_var = tk.StringVar(
+            value=self._allstar_level_label())
+        allstar_combo = ttk.Combobox(
+            self._gm_allstar_frame, textvariable=self.allstar_level_var,
+            values=[str(i) for i in range(1, 8)] + ["Elim"],
+            state="readonly", width=6)
+        allstar_combo.pack(anchor="w", pady=(0, 2))
+        allstar_combo.bind("<<ComboboxSelected>>", self._on_allstar_level)
+
+        # Elim sub-options: per-level boss picks
+        self._gm_elim_frame = tk.Frame(self._gm_allstar_frame,
+                                       bg=self.theme["surface"],
+                                       highlightthickness=0)
+        self._elim_summary = tk.Label(
+            self._gm_elim_frame, foreground=self.theme["fg_dim"],
+            bg=self.theme["surface"], font=(ui_font(), 9))
+        self._elim_summary.pack(anchor="w", pady=(2, 0))
+        ttk.Button(self._gm_elim_frame, text="Choose bosses…",
+                   command=self._open_elim_picker).pack(
+                       anchor="w", pady=(2, 2))
+
+        self._gm_allstar_hint = tk.Label(
+            self._gm_allstar_frame, foreground=self.theme["fg_muted"],
+            bg=self.theme["surface"], font=(ui_font(), 9), justify="left",
+            wraplength=240)
+        self._gm_allstar_hint.pack(anchor="w", pady=(0, 2))
+        self._update_allstar_sub()
+
         self._update_game_mode_disclosure()
 
     def _on_chapter_toggle(self):
@@ -902,11 +945,23 @@ class App:
         self._schedule_autosave()
         gm = self._game_mode_id()
         main.log(f"game mode: {_GM_ID_TO_NAME.get(gm, gm)}")
+        # One-time heads-up: All-Star mode depends on fast input via a
+        # writable /dev/input node, which only a rooted BlueStacks instance
+        # provides.  Shown once, then remembered in settings.
+        if gm == "allstar" and not config.ALL_STAR_ROOT_WARNED:
+            config.ALL_STAR_ROOT_WARNED = True
+            messagebox.showwarning(
+                "All-Star Cup",
+                "All-Star Cup mode ONLY works on a rooted BlueStacks "
+                "instance.\n\nIt will not work on a regular phone or an "
+                "unrooted emulator. (This warning is shown once.)",
+                parent=self.root)
 
     def _update_game_mode_disclosure(self):
         """Show/hide the mode-specific sub-options."""
         for w in (self._gm_chapter_frame, self._gm_plant_frame,
-                  self._gm_eternal_frame, self._gm_jungle_hint):
+                  self._gm_eternal_frame, self._gm_jungle_hint,
+                  self._gm_allstar_frame):
             w.pack_forget()
         gm = self._game_mode_id()
         if gm == "chapter":
@@ -919,6 +974,9 @@ class App:
             self._gm_eternal_frame.pack(fill="x")
         elif gm == "jungle":
             self._gm_jungle_hint.pack(anchor="w", pady=4)
+        elif gm == "allstar":
+            self._gm_allstar_frame.pack(fill="x")
+            self._update_allstar_sub()
 
     def _on_chapter_move(self):
         self._schedule_autosave()
@@ -926,6 +984,280 @@ class App:
     def _on_el_fast_toggle(self):
         config.EL_FAST_MODE = self._el_fast_var.get()
         self._schedule_autosave()
+
+    @staticmethod
+    def _normalized_elim_picks():
+        """config.ALL_STAR_ELIM_BOSSES padded/trimmed to exactly one entry per
+        Elim level ("" = no pick)."""
+        n = int(config.ALL_STAR_ELIM_SETS)
+        picks = [str(b) for b in getattr(config, "ALL_STAR_ELIM_BOSSES", [])]
+        return (picks + [""] * n)[:n]
+
+    @staticmethod
+    def _allstar_level_label():
+        lvl = getattr(config, "ALL_STAR_LEVEL", 1)
+        return "Elim" if str(lvl).strip().lower() == "elim" else str(lvl)
+
+    def _allstar_is_elim(self):
+        return self.allstar_level_var.get().strip().lower() == "elim"
+
+    def _on_allstar_level(self, _event=None):
+        val = self.allstar_level_var.get()
+        if val.strip().lower() == "elim":
+            config.ALL_STAR_LEVEL = "elim"
+        else:
+            try:
+                config.ALL_STAR_LEVEL = int(val)
+            except ValueError:
+                return
+        self._update_allstar_sub()
+        self._schedule_autosave()
+
+    def _update_allstar_sub(self):
+        """Show/hide the Elim boss-pick row and swap the hint text to match
+        the selected All-Star level."""
+        if self._allstar_is_elim():
+            self._render_elim_summary()
+            self._gm_elim_frame.pack(fill="x", before=self._gm_allstar_hint)
+            self._gm_allstar_hint.configure(
+                text="Position the game on the Elim entry screen, then "
+                     "Start. The macro picks your chosen boss at each of "
+                     f"the {config.ALL_STAR_ELIM_SETS} levels.")
+        else:
+            self._gm_elim_frame.pack_forget()
+            self._gm_allstar_hint.configure(
+                text="Position the game on the level's Challenge screen, "
+                     "then Start. The macro identifies the 3 bosses each "
+                     "set and picks the fastest-dying one, then stops.")
+
+    def _render_elim_summary(self):
+        chosen = sum(1 for b in self.elim_bosses if b)
+        self._elim_summary.configure(
+            text=f"Bosses chosen: {chosen}/{len(self.elim_bosses)}"
+                 + ("" if chosen == len(self.elim_bosses)
+                    else "  (unset = best visible)"))
+
+    # ------------------------------------------------------------------ Elim boss picker
+
+    def _boss_thumb(self, name, size):
+        """Square thumbnail of a boss template, letterboxed on black (the
+        templates are black-bg crops of varying aspect)."""
+        key = (name, size)
+        if key in self._boss_thumb_cache:
+            return self._boss_thumb_cache[key]
+        photo = None
+        path = config.ALL_STAR_BOSS_DIR / f"{name}.png"
+        if path.exists():
+            try:
+                img = Image.open(path).convert("RGB")
+                img.thumbnail((size, size), _RESAMPLE)
+                square = Image.new("RGB", (size, size), "#000000")
+                square.paste(img, ((size - img.width) // 2,
+                                   (size - img.height) // 2))
+                photo = ImageTk.PhotoImage(square)
+            except Exception:
+                photo = None
+        self._boss_thumb_cache[key] = photo
+        return photo
+
+    def _open_elim_picker(self):
+        if self._elim_picker is not None:
+            try:
+                if self._elim_picker.winfo_exists():
+                    self._elim_picker.lift()
+                    return
+            except tk.TclError:
+                pass
+            self._elim_picker = None
+
+        p = self.theme
+        win = tk.Toplevel(self.root)
+        self._elim_picker = win
+        win.title("Elim boss picks")
+        win.geometry("900x680")
+        win.transient(self.root)
+        win.configure(background=p["bg"])
+        set_dark_titlebar(win, self.dark)
+
+        head = tk.Frame(win, bg=p["bg"], highlightthickness=0)
+        head.pack(fill="x", padx=12, pady=(10, 2))
+        tk.Label(head, text="Elim boss picks", font=(ui_font(), 12, "bold"),
+                 fg=p["fg"], bg=p["bg"]).pack(side="left")
+        tk.Label(head,
+                 text="Click a boss to assign it to the highlighted level. "
+                      "Click a level to select it; right-click clears it.",
+                 fg=p["fg_muted"], bg=p["bg"],
+                 font=(ui_font(), 9)).pack(side="left", padx=(14, 0))
+
+        # Level slot strip: stays visible above the scrolling boss grid.
+        self._elim_slot_strip = tk.Frame(win, bg=p["bg"],
+                                         highlightthickness=0)
+        self._elim_slot_strip.pack(fill="x", padx=12, pady=(4, 6))
+        self._elim_sel = next(
+            (i for i, b in enumerate(self.elim_bosses) if not b), 0)
+        self._render_elim_slots()
+
+        # Scrollable boss grid
+        canvas = tk.Canvas(win, borderwidth=0, highlightthickness=0,
+                           background=p["bg"])
+        vsb = ttk.Scrollbar(win, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+
+        footer = tk.Frame(win, bg=p["bg"], highlightthickness=0)
+        footer.pack(side="bottom", fill="x", padx=12, pady=(6, 10))
+        self._elim_counts = tk.Label(footer, text="", fg=p["fg_muted"],
+                                     bg=p["bg"], font=(ui_font(), 9))
+        self._elim_counts.pack(side="left")
+        RoundedButton(footer, text="Done", command=win.destroy,
+                      bg=p["accent"], fg="#ffffff",
+                      font=(ui_font(), 9, "bold"), radius=6,
+                      canvas_bg=p["bg"]).pack(side="right")
+        ttk.Button(footer, text="Clear all",
+                   command=self._elim_clear_all).pack(
+                       side="right", padx=(0, 8))
+
+        vsb.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+
+        body = tk.Frame(canvas, bg=p["bg"], highlightthickness=0)
+        cwin = canvas.create_window((0, 0), window=body, anchor="nw")
+        body.bind("<Configure>",
+                  lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>",
+                    lambda e: canvas.itemconfigure(cwin, width=e.width))
+
+        def _wheel(event):
+            canvas.yview_scroll(int(-event.delta / 120), "units")
+        canvas.bind("<Enter>",
+                    lambda e: canvas.bind_all("<MouseWheel>", _wheel))
+        canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
+
+        self._elim_body = body
+        win.protocol("WM_DELETE_WINDOW", win.destroy)
+        self._render_elim_body()
+        self._update_elim_footer()
+
+    def _render_elim_slots(self):
+        strip = getattr(self, "_elim_slot_strip", None)
+        if strip is None:
+            return
+        try:
+            if not strip.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        for child in strip.winfo_children():
+            child.destroy()
+        p = self.theme
+        size = 48
+        for i, name in enumerate(self.elim_bosses):
+            unit = tk.Frame(strip, bg=p["bg"], highlightthickness=0)
+            unit.grid(row=0, column=i, padx=4)
+            sel = (i == self._elim_sel)
+            cell = tk.Canvas(unit, width=size + 6, height=size + 6,
+                             highlightthickness=0, bg=p["bg"],
+                             cursor="hand2", bd=0)
+            draw_rounded_rect(cell, 1, 1, size + 4, size + 4, 6,
+                              fill="#000000" if name else p["surface_3"],
+                              outline=p["accent"] if sel
+                              else p["border_strong"],
+                              width=2 if sel else 1)
+            photo = self._boss_thumb(name, size - 6) if name else None
+            if photo is not None:
+                cell.create_image((size + 6) // 2, (size + 6) // 2,
+                                  image=photo)
+                cell._photo = photo         # keep the PhotoImage alive
+            else:
+                cell.create_text((size + 6) // 2, (size + 6) // 2,
+                                 text="?" if name else "+",
+                                 fill=p["fg_muted"], font=(ui_font(), 16))
+            cell.pack()
+            lbl = tk.Label(unit, text=f"L{i + 1}",
+                           fg=p["accent"] if sel else p["fg_dim"],
+                           bg=p["bg"],
+                           font=(ui_font(), 8, "bold" if sel else "normal"))
+            lbl.pack()
+            for w in (cell, lbl):
+                w.bind("<Button-1>",
+                       lambda e, idx=i: self._elim_select_slot(idx))
+                w.bind("<Button-3>",
+                       lambda e, idx=i: self._elim_clear_slot(idx))
+
+    def _elim_select_slot(self, idx):
+        self._elim_sel = idx
+        self._render_elim_slots()
+
+    def _elim_clear_slot(self, idx):
+        self.elim_bosses[idx] = ""
+        self._elim_sel = idx
+        self._elim_changed()
+
+    def _elim_assign(self, name):
+        self.elim_bosses[self._elim_sel] = name
+        self._elim_sel = min(self._elim_sel + 1, len(self.elim_bosses) - 1)
+        self._elim_changed()
+
+    def _elim_clear_all(self):
+        self.elim_bosses = [""] * len(self.elim_bosses)
+        self._elim_sel = 0
+        self._elim_changed()
+
+    def _elim_changed(self):
+        self._render_elim_slots()
+        self._render_elim_summary()
+        self._update_elim_footer()
+        self._schedule_autosave()
+
+    def _update_elim_footer(self):
+        lbl = getattr(self, "_elim_counts", None)
+        if lbl is None:
+            return
+        try:
+            chosen = sum(1 for b in self.elim_bosses if b)
+            lbl.configure(text=f"● {chosen}/{len(self.elim_bosses)} levels "
+                               "assigned")
+        except tk.TclError:
+            pass
+
+    def _render_elim_body(self):
+        """One flat grid of every boss, fastest death anim first.  Elim
+        scatters bosses across its levels randomly per event, so the All-Star
+        level groupings mean nothing here."""
+        body = self._elim_body
+        p = self.theme
+        anim = {n: s for lp in config.ALL_STAR_LEVELS.values()
+                for n, s in lp.items()}
+        grid = tk.Frame(body, bg=p["bg"], highlightthickness=0)
+        grid.pack(anchor="w", padx=8, pady=(8, 4))
+        cols = 9
+        for j, name in enumerate(sorted(anim, key=anim.__getitem__)):
+            tile = self._elim_boss_tile(grid, name, anim[name])
+            tile.grid(row=j // cols, column=j % cols, padx=3, pady=3,
+                      sticky="n")
+
+    def _elim_boss_tile(self, parent, name, secs):
+        p = self.theme
+        tile = tk.Frame(parent, bg=p["bg"], highlightthickness=0,
+                        cursor="hand2")
+        cell = tk.Canvas(tile, width=62, height=62, highlightthickness=0,
+                         bg=p["bg"], bd=0)
+        draw_rounded_rect(cell, 1, 1, 60, 60, 6, fill="#000000",
+                          outline=p["border_strong"])
+        photo = self._boss_thumb(name, 52)
+        if photo is not None:
+            cell.create_image(31, 31, image=photo)
+            cell._photo = photo
+        cell.pack()
+        tk.Label(tile, text=name, fg=p["fg_dim"], bg=p["bg"],
+                 font=(ui_font(), 7), wraplength=84,
+                 justify="center").pack()
+        tk.Label(tile, text=f"{secs:.2f}s", fg=p["fg"], bg=p["bg"],
+                 font=(ui_font(), 8, "bold")).pack()
+        handler = lambda e, n=name: self._elim_assign(n)
+        tile.bind("<Button-1>", handler)
+        for w in tile.winfo_children():
+            w.bind("<Button-1>", handler)
+        return tile
 
     def _on_plant_dir(self):
         self._schedule_autosave()
@@ -1436,9 +1768,8 @@ class App:
         # Movement vector vars (4 floats each: angle1, dur1, angle2, dur2)
         for key in ("MOVEMENT_CHAPTER", "MOVEMENT_CUSTOM"):
             self.vars[key] = [tk.StringVar() for _ in range(4)]
-        # Plant Defense movement vars
-        self.movement_plant_preset_var = tk.StringVar(
-            value=config.MOVEMENT_PLANT_PRESET)
+        # Plant Defense movement vars.  The direction preset itself lives in
+        # plant_dir_var (the D-pad in the game-mode card).
         self.movement_plant_t_var = tk.StringVar(
             value=str(config.MOVEMENT_PLANT_T))
         self.movement_plant_spawn_var = tk.IntVar(value=1)
@@ -3197,6 +3528,10 @@ class App:
         # Eternal Lode options
         self._el_fast_var.set(config.EL_FAST_MODE)
 
+        # All-Star level + Elim picks
+        self.allstar_level_var.set(self._allstar_level_label())
+        self.elim_bosses = self._normalized_elim_picks()
+
         # Plant direction
         self.plant_dir_var.set(config.MOVEMENT_PLANT_PRESET)
 
@@ -3249,6 +3584,13 @@ class App:
         out["GAME_MODE"] = gm
         out["ETERNAL_LODE_MODE"] = (gm == "eternal")
         out["EL_FAST_MODE"] = bool(self._el_fast_var.get())
+        try:
+            val = self.allstar_level_var.get()
+            out["ALL_STAR_LEVEL"] = ("elim" if val.strip().lower() == "elim"
+                                     else int(val))
+        except (ValueError, AttributeError):
+            out["ALL_STAR_LEVEL"] = config.ALL_STAR_LEVEL
+        out["ALL_STAR_ELIM_BOSSES"] = list(self.elim_bosses)
 
         if gm == "chapter":
             out["MOVEMENT_MODE"] = (
@@ -3262,7 +3604,6 @@ class App:
         try:
             for key in ("MOVEMENT_CHAPTER", "MOVEMENT_CUSTOM"):
                 out[key] = [float(b.get()) for b in self.vars[key]]
-            out["MOVEMENT_PLANT_PRESET"] = self.movement_plant_preset_var.get()
             out["MOVEMENT_PLANT_T"] = float(self.movement_plant_t_var.get())
         except ValueError:
             if not quiet:
@@ -3456,7 +3797,7 @@ class App:
         if self._thread is not None and self._thread.is_alive():
             return
         gm = self._game_mode_id()
-        if gm != "eternal" and not self.active and not self.custom:
+        if gm not in ("eternal", "allstar") and not self.active and not self.custom:
             if not messagebox.askyesno(
                     "Nothing to pick",
                     "No skill categories are active and no custom priority "
@@ -3477,8 +3818,12 @@ class App:
 
     def _run_thread(self):
         gm = self._game_mode_id()
-        runner = (eternal_lode.run_eternal_lode if gm == "eternal"
-                  else main.run_macro)
+        if gm == "eternal":
+            runner = eternal_lode.run_eternal_lode
+        elif gm == "allstar":
+            runner = all_star.run_all_star
+        else:
+            runner = main.run_macro
         try:
             runner(self._stop_event)
         except Exception as e:

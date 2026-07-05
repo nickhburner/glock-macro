@@ -59,6 +59,12 @@ PLANT_SPAWN_BY_START = (
     ("get-ready", 2),
 )
 
+# Max taps on the co-op Like button per round.  The pressed (inactive) button
+# can still resemble the template, so without a cap the macro could sit on the
+# results screen tapping Like forever instead of advancing.  Resets whenever a
+# gamemode start button is tapped (= a new round began).
+LIKE_TAP_LIMIT = 3
+
 
 # ------------------------------------------------------------------
 # Logging
@@ -120,19 +126,6 @@ def close_target():
             log(f"  closed {name}")
         else:
             log(f"  {name} not running")
-
-
-def _is_running(image_name):
-    """True if a process with this .exe image name is currently running."""
-    try:
-        result = subprocess.run(
-            ["tasklist", "/FI", f"IMAGENAME eq {image_name}", "/NH"],
-            capture_output=True, text=True, timeout=15,
-            creationflags=_NO_WINDOW,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return image_name.lower() in result.stdout.lower()
 
 
 def sleep_phone():
@@ -206,6 +199,20 @@ class Macro:
             "start_challenge", "ad-start", "ready-hard-chapter",
             "start-chapter", "start-hard-chapter*")
 
+        # Co-op Like button: checked BEFORE everything else so the other player
+        # gets their like before any tap advances past the results screen.
+        # Capped at LIKE_TAP_LIMIT per round.
+        self.like_button = self._load_group("like")
+        self._like_taps = 0
+
+        # Plant Defense level correction (host only): the game auto-advances to
+        # the next level after a completed round, so when the Start Challenge
+        # button reappears AFTER any round activity, the Back button is tapped
+        # once first to return to the level the user picked.  False at start so
+        # the very first Start never triggers it.
+        self.back_plant = self._load_group("back-plant-level")
+        self._plant_round_done = False
+
         # Speed button (cycles 1x -> 2x -> 3x). Driven to max speed each match.
         self.speed_refs = {}
         for spd, nm in (("1x", "1x-speed"), ("2x", "2x-speed"), ("3x", "3x-speed")):
@@ -234,9 +241,27 @@ class Macro:
         self.spin_wheel   = self._load_group("spin-wheel")
         self.wheel_reward = self._load_group("wheel-reward")
 
-        # Custom "press it when you see it" buttons (ref/custom/).
+        # Custom "press it when you see it" buttons (ref/custom/).  A custom
+        # capture that shares a name with a built-in ref is skipped: older
+        # releases shipped some now-built-in buttons (e.g. like.png) as custom
+        # captures, and the updater preserves ref/custom/, so without this an
+        # updated install would load the same button twice (and the uncapped
+        # custom copy would bypass the built-in behavior, like the Like cap).
+        builtin_names = {"refresh", "valkyrie", "level", "glory", "angel"}
+        for group in (self.tap_buttons, self.like_button, self.back_plant,
+                      self.challenge_ended_continue, self.challenge_ended,
+                      self.continue_button, self.spin_wheel, self.wheel_reward,
+                      *self.speed_refs.values()):
+            if group and isinstance(group, tuple):    # a single (name, tpl, zone)
+                builtin_names.add(group[0])
+            else:
+                builtin_names.update(name for name, *_ in group)
         self.custom_refs = []
         for path in sorted(config.REF_CUSTOM_DIR.glob("*.png")):
+            if path.stem in builtin_names:
+                log(f"NOTE: custom button '{path.name}' duplicates the "
+                    f"built-in ref of the same name, skipping")
+                continue
             try:
                 zone = self._zones.get(f"custom/{path.name}", "full")
                 self.custom_refs.append((path.stem, load_template(path), zone))
@@ -688,9 +713,24 @@ class Macro:
             self._tap(round(w * config.BOTTOM_TAP_X_RATIO),
                       round(h * config.BOTTOM_TAP_Y_RATIO), label)
 
+        # 0. Co-op Like button: checked before everything else so the like
+        #    lands before any other tap advances past the screen it is on.
+        #    Capped per round so an already-pressed button can't stall the loop.
+        if self.like_button and self._like_taps < LIKE_TAP_LIMIT:
+            lname, lconf, lcenter = self._detect(image, self.like_button)
+            if lconf >= config.REF_THRESHOLD and lcenter is not None:
+                self._like_taps += 1
+                self._plant_round_done = True
+                log(f"like button (conf {lconf:.2f}) -> tap "
+                    f"({self._like_taps}/{LIKE_TAP_LIMIT} this round)")
+                self._tap(lcenter[0], lcenter[1], "like")
+                time.sleep(rand_delay(config.ACTION_DELAY))
+                return "like"
+
         # 1. Skill selection, detected by any banner (valkyrie/level/glory/angel).
         indicator, iconf = self._best_skill_banner(image)
         if iconf >= config.REF_THRESHOLD:
+            self._plant_round_done = True       # a round is being played
             if self._move_armed:
                 self._move_in_skill = True      # a skill screen is up
             # The cards and the Refresh button animate in after the banner shows.
@@ -752,6 +792,7 @@ class Macro:
         #    on every poll and the tap_buttons scan below is never reached.
         c3name, c3conf, _ = self._detect(image, self.challenge_ended_continue)
         if c3conf >= config.REF_THRESHOLD:
+            self._plant_round_done = True
             bname, bconf, bcenter = self._detect(image, self.continue_button)
             if bconf >= config.REF_THRESHOLD and bcenter is not None:
                 log(f"challenge ended [{c3name} {c3conf:.2f}] -> Continue "
@@ -764,6 +805,7 @@ class Macro:
             return "challenge_ended"
         cname, cconf, _ = self._detect(image, self.challenge_ended)
         if cconf >= config.REF_THRESHOLD:
+            self._plant_round_done = True
             log(f"challenge ended [{cname} {cconf:.2f}] -> dismiss (centre tap)")
             time.sleep(rand_delay(config.ACTION_DELAY))
             self._tap(round(w * 0.50), round(h * 0.50), "dismiss results")
@@ -773,6 +815,7 @@ class Macro:
         # 3. Wheel reward (won a skill from the spin): accept with a centre tap.
         rwname, rwconf, _ = self._detect(image, self.wheel_reward)
         if rwconf >= config.REF_THRESHOLD:
+            self._plant_round_done = True
             log(f"wheel reward [{rwname} {rwconf:.2f}] -> accept (centre tap)")
             time.sleep(rand_delay(config.ACTION_DELAY))
             self._tap(round(w * 0.50), round(h * 0.50), "wheel reward accept")
@@ -782,6 +825,7 @@ class Macro:
         # 4. Spin wheel: tap it, then clear any result popups near the bottom.
         swname, swconf, swcenter = self._detect(image, self.spin_wheel)
         if swconf >= config.REF_THRESHOLD and swcenter is not None:
+            self._plant_round_done = True
             log(f"spin wheel [{swname} {swconf:.2f}] -> spin, dismiss popups")
             self._tap(swcenter[0], swcenter[1], "spin wheel")
             for i in range(2):
@@ -792,9 +836,34 @@ class Macro:
         # 5. Tap-on-sight buttons (devil reject, play, continue, start*, ...).
         bname, bconf, bcenter = self._detect(image, self.tap_buttons)
         if bconf >= config.REF_THRESHOLD and bcenter is not None:
+            # Plant Defense level correction (host only): a completed round
+            # auto-advances the game to the next level, so when Start Challenge
+            # reappears after round activity, tap Back ONCE first to return to
+            # the level the user picked.  The flag is cleared before tapping so
+            # it can never fire twice, and it starts False so the very first
+            # Start of a run never triggers it.
+            if (config.GAME_MODE == "plant" and self._plant_round_done
+                    and bname.startswith(("start_challenge", "start-challenge"))
+                    and self.back_plant):
+                self._plant_round_done = False
+                pname, pconf, pcenter = self._detect(image, self.back_plant)
+                if pconf >= config.REF_THRESHOLD and pcenter is not None:
+                    log(f"round done -> back one level [{pname} {pconf:.2f}]")
+                    self._tap(pcenter[0], pcenter[1], "back-plant-level")
+                    time.sleep(rand_delay(config.ACTION_DELAY))
+                    return "plant_back"
+                log("round done but back-plant-level button not visible; "
+                    "starting without the level correction")
             log(f"button '{bname}' (conf {bconf:.2f}) -> tap")
             self._tap(bcenter[0], bcenter[1], bname)
             self._maybe_arm_movement(bname)
+            if any(bname.startswith(p) for p in MOVEMENT_START_BUTTONS):
+                # A round is starting: reset the per-round like cap and the
+                # round-completed flag.
+                self._like_taps = 0
+                self._plant_round_done = False
+            else:
+                self._plant_round_done = True
             time.sleep(rand_delay(config.ACTION_DELAY))
             return "button"
 
@@ -805,6 +874,11 @@ class Macro:
                 log(f"custom button '{name}' (conf {conf:.2f}) -> tap")
                 self._tap(center[0], center[1], f"custom: {name}")
                 self._maybe_arm_movement(name)
+                if any(name.startswith(p) for p in MOVEMENT_START_BUTTONS):
+                    self._like_taps = 0
+                    self._plant_round_done = False
+                else:
+                    self._plant_round_done = True
                 time.sleep(rand_delay(config.ACTION_DELAY))
                 return "custom"
 
@@ -828,23 +902,6 @@ class Macro:
 
         # 8. Nothing actionable; character is playing.
         return "idle"
-
-
-# ------------------------------------------------------------------
-# Scale calibration stub
-# ------------------------------------------------------------------
-
-def measure_game_scale(image):
-    """OBSOLETE with ADB.  Kept so gui.py's Calibrate button does not crash.
-    Returns a failure result directing the user to the ADB setup instead."""
-    return {
-        "ok": False,
-        "reason": (
-            "Scale calibration via screen capture has been replaced by the "
-            "one-time ADB calibration.  Connect a device via the ADB device "
-            "selector and run Calibrate from there."
-        ),
-    }
 
 
 # ------------------------------------------------------------------

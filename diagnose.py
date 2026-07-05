@@ -250,8 +250,8 @@ def save_annotated(image):
 
     refs = {
         "play": config.REF_PLAY, "devil": config.REF_DEVIL,
-        "game_over": config.REF_GAME_OVER, "valkyrie": config.REF_VALKYRIE,
-        "level": config.REF_LEVEL, "glory": config.REF_GLORY,
+        "valkyrie": config.REF_VALKYRIE, "level": config.REF_LEVEL,
+        "glory": config.REF_GLORY, "angel": config.REF_ANGEL,
         "refresh": config.REF_REFRESH,
     }
     for name, path in refs.items():

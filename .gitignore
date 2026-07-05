@@ -6,6 +6,8 @@ __pycache__/
 build/
 dist/
 *.spec
+# ...except the curated main-exe spec build.bat uses (carries the cv2 trim)
+!A2 Macro Controller.spec
 
 # Diagnostic captures
 debug_capture.png
@@ -18,7 +20,16 @@ skills_raw/
 # Per-machine settings; ship settings.example.json instead
 settings.json
 
+# Per-machine custom button captures (user data, preserved by the updater)
+ref/custom/
+
+# Old release archives kept locally
+*.zip
+
 # Dev screenshots / test images
 *.png.bak
 2 skill.png
 3 skill.png
+
+# fastinput_check.py diagnostic output
+_fastcheck/
