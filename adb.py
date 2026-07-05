@@ -241,8 +241,10 @@ def find_adb(config_path: str = "adb") -> str:
             return str(p)
 
     raise RuntimeError(
-        "adb not found. Install adb (comes with scrcpy or BlueStacks) and "
-        "either add it to PATH or set ADB_PATH in settings."
+        "adb not found. Click the 'adb…' button in the Device panel and pick "
+        "HD-Adb.exe from inside your BlueStacks folder (search for HD-Adb.exe "
+        "in File Explorer if unsure where it is). If BlueStacks did not come "
+        "with one, install Android platform-tools and pick its adb.exe instead."
     )
 
 

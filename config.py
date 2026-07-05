@@ -5,7 +5,7 @@ from pathlib import Path
 # App version, baked into each build. The updater compares the GitHub release
 # tag against version.txt (written by build.bat), NOT this constant; this one
 # is for the main app to display. Bump both before tagging a release.
-VERSION = "2.2.1"
+VERSION = "2.2.2"
 
 # Paths
 if getattr(sys, "frozen", False):
@@ -620,6 +620,7 @@ PERSISTED_KEYS = (
     "CLOSE_ON_TIMEOUT", "SLEEP_PHONE_ON_TIMEOUT",
     "MATCH_THRESHOLD", "REF_THRESHOLD", "SKILL_DOWNSCALE", "REF_DOWNSCALE",
     "CALIBRATED_SCALE", "ADB_DEVICE", "PHONE_RESOLUTION", "ADB_SERVER_PORT",
+    "ADB_PATH",
     "CLICK_JITTER", "DELAY_JITTER",
     "FIRST_SKILL_SLOT", "SECOND_SKILL_SLOT", "GAME_OVER_TAP",
     "SKILL_MATCH_BAND",

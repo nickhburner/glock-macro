@@ -12,8 +12,9 @@ Usage:
 import ctypes
 import queue
 import threading
+from pathlib import Path
 import tkinter as tk
-from tkinter import messagebox, simpledialog, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from PIL import Image, ImageTk
 
@@ -800,6 +801,14 @@ class App:
         refresh_btn.pack(side="left", padx=(6, 0))
         Tooltip(refresh_btn, "Scan for connected ADB devices.")
 
+        locate_btn = ttk.Button(row, text="adb…", width=5,
+                                 command=self._locate_adb)
+        locate_btn.pack(side="left", padx=(4, 0))
+        Tooltip(locate_btn,
+                "Point the macro at adb yourself. Use this if scanning says "
+                "'adb not found': pick HD-Adb.exe inside your BlueStacks "
+                "folder (or any adb.exe).")
+
         self.adb_status_label = tk.Label(
             row, text="", font=(ui_font(), 8),
             foreground=self.theme["fg_muted"], bg=self.theme["surface"])
@@ -1321,6 +1330,31 @@ class App:
         self._timeout_cb2.pack(anchor="w", pady=(2, 4))
         Tooltip(self._timeout_cb2,
                 "Turn the phone screen off via ADB when the timeout fires.")
+
+    def _locate_adb(self):
+        """Let the user browse to an adb binary by hand (the rescue path when
+        find_adb() cannot locate one automatically). Saves ADB_PATH to
+        settings.json immediately, then rescans for devices."""
+        path = filedialog.askopenfilename(
+            parent=self.root,
+            title="Pick adb.exe or HD-Adb.exe",
+            initialdir=r"C:\Program Files",
+            filetypes=[("adb executable", "adb.exe HD-Adb.exe"),
+                       ("Programs", "*.exe")])
+        if not path:
+            return
+        name = Path(path).name.lower()
+        if "adb" not in name:
+            messagebox.showwarning(
+                "Locate adb",
+                f"{Path(path).name} does not look like adb.\n\n"
+                "Pick HD-Adb.exe (inside your BlueStacks folder) or adb.exe.",
+                parent=self.root)
+            return
+        config.ADB_PATH = path
+        config.save_settings()
+        main.log(f"adb path set manually: {path}")
+        self._refresh_adb_devices()
 
     def _refresh_adb_devices(self):
         """Scan for ADB devices and update the dropdown."""
