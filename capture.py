@@ -77,6 +77,29 @@ def unavailable_reason() -> str:
     return "" if av is not None else f"PyAV not available ({_AV_IMPORT_ERROR})"
 
 
+def kill_device_screenrecord(adb_exe: str, serial: Optional[str]) -> None:
+    """Kill any `screenrecord` process still running ON THE DEVICE.
+
+    Killing our host-side adb.exe (the other end of the pipe) does NOT
+    reliably kill the device-side screenrecord: on a wedged transport it
+    lingers and keeps the hardware AVC encoder claimed, so every relaunch
+    times out without ever producing a frame -- and each retry stacks another
+    zombie recorder on the phone. Enough of them can freeze the phone outright
+    (observed on a Galaxy S20). SIGINT is screenrecord's clean-stop signal;
+    pkill exiting non-zero (no process matched) is the normal case and fine.
+    """
+    cmd = [adb_exe]
+    if serial:
+        cmd += ["-s", serial]
+    cmd += ["shell", "pkill", "-2", "screenrecord"]
+    try:
+        subprocess.run(cmd, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=4.0,
+                       creationflags=_NO_WINDOW)
+    except Exception:
+        pass    # transport still wedged; the caller's reconnect handles that
+
+
 def open_stream(adb_exe: str, serial: Optional[str], attempts: int = 3,
                 per_attempt_timeout: float = 4.0, on_log=None
                 ) -> Optional["ScreenRecordStream"]:
@@ -112,6 +135,10 @@ def open_stream(adb_exe: str, serial: Optional[str], attempts: int = 3,
         if attempt < attempts:
             _say(f"capture: no stream frame in {per_attempt_timeout:.0f}s, "
                  f"retrying ({attempt}/{attempts})")
+            # A failed launch can leave a device-side screenrecord holding the
+            # hardware encoder, which would starve the next attempt too.
+            kill_device_screenrecord(adb_exe, serial)
+            time.sleep(1.0)
     return None
 
 
@@ -249,6 +276,11 @@ class ScreenRecordStream:
                                     "giving up (caller will handle recovery)",
                                     consec_errors)
                         break
+                    # An abnormal segment end can orphan the device-side
+                    # recorder; clean it up so the relaunch can grab the
+                    # encoder (a normal time-limit end exits by itself).
+                    self._kill_proc()
+                    kill_device_screenrecord(self._adb, self._serial)
                     time.sleep(0.5)
             else:
                 if got_frame:

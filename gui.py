@@ -922,6 +922,30 @@ class App:
                  "check round 1 if unsure.")
         self._plant_spawn_hint.pack(anchor="w", pady=(0, 4))
 
+        # Round limit: play this many full rounds of the level, then stop.
+        self._gm_plant_rounds_sub = RoundedSection(
+            self._gm_plant_frame, title="ROUNDS",
+            bg=self.theme["surface_2"],
+            border_color=self.theme["border"],
+            title_fg=self.theme["fg_dim"], radius=6)
+        self._gm_plant_rounds_sub.pack(fill="x", pady=(4, 0))
+        rounds_row = tk.Frame(self._gm_plant_rounds_sub.inner,
+                              bg=self.theme["surface_2"])
+        rounds_row.pack(anchor="w", pady=(4, 4))
+        self.plant_rounds_var = tk.StringVar(value=str(config.PLANT_ROUNDS))
+        rounds_entry = ttk.Entry(rounds_row, width=6,
+                                 textvariable=self.plant_rounds_var)
+        rounds_entry.pack(side="left")
+        tk.Label(rounds_row, text="rounds, then stop (0 = unlimited)",
+                 foreground=self.theme["fg_muted"], bg=self.theme["surface_2"],
+                 font=(ui_font(), 9)).pack(side="left", padx=(6, 0))
+        Tooltip(rounds_entry,
+                "Stop the macro after this many completed rounds of the "
+                "level. 0 keeps it running until stopped or the run "
+                "timeout hits.")
+        self.plant_rounds_var.trace_add(
+            "write", lambda *_a: self._schedule_autosave())
+
         # Eternal Lode sub-frame
         self._gm_eternal_frame = tk.Frame(
             self._gm_disclosure, bg=self.theme["surface"])
@@ -1940,7 +1964,7 @@ class App:
                                   parent_bg=p["bg"])
         for attr in ("_inactive_section", "_active_section",
                      "_gm_chapter_sub", "_gm_plant_sub",
-                     "_gm_plant_spawn_sub"):
+                     "_gm_plant_spawn_sub", "_gm_plant_rounds_sub"):
             sec = getattr(self, attr, None)
             if sec is not None:
                 sec.update_colors(bg=p["surface_2"],
@@ -3612,9 +3636,10 @@ class App:
         self.allstar_level_var.set(self._allstar_level_label())
         self.elim_bosses = self._normalized_elim_picks()
 
-        # Plant direction + spawn side
+        # Plant direction + spawn side + round limit
         self.plant_dir_var.set(config.MOVEMENT_PLANT_PRESET)
         self.plant_spawn_bool.set(config.PLANT_SPAWN == 2)
+        self.plant_rounds_var.set(str(config.PLANT_ROUNDS))
 
         # Movement vector fields
         for key in ("MOVEMENT_CHAPTER", "MOVEMENT_CUSTOM"):
@@ -3680,6 +3705,13 @@ class App:
             out["MOVEMENT_MODE"] = 2
             out["MOVEMENT_PLANT_PRESET"] = self.plant_dir_var.get()
             out["PLANT_SPAWN"] = 2 if self.plant_spawn_bool.get() else 1
+            # Mid-typing values ("" while editing) must not block a save;
+            # fall back to the current setting instead of erroring.
+            try:
+                out["PLANT_ROUNDS"] = max(
+                    0, int(float(self.plant_rounds_var.get())))
+            except ValueError:
+                out["PLANT_ROUNDS"] = config.PLANT_ROUNDS
         else:
             out["MOVEMENT_MODE"] = 0
 

@@ -55,6 +55,13 @@ MOVEMENT_START_BUTTONS = (
 # gamemode start button is tapped (= a new round began).
 LIKE_TAP_LIMIT = 3
 
+# Plant Defense round limiting (config.PLANT_ROUNDS).  A round is counted when
+# the challenge-ended screen is seen; that screen keeps matching across polls
+# while it is being dismissed, so sightings within this window are the same
+# round (a real round lasts minutes).  Buttons that would start the NEXT round:
+PLANT_ROUND_DEBOUNCE = 60.0
+PLANT_START_BUTTONS = ("start_challenge", "start-challenge", "get-ready")
+
 
 # ------------------------------------------------------------------
 # Logging
@@ -202,6 +209,10 @@ class Macro:
         # the very first Start never triggers it.
         self.back_plant = self._load_group("back-plant-level")
         self._plant_round_done = False
+        # Round limiting: completed rounds this run + when the last one was
+        # counted (for the challenge-ended debounce).
+        self._plant_rounds_played = 0
+        self._plant_round_end_ts = 0.0
 
         # Speed button (cycles 1x -> 2x -> 3x). Driven to max speed each match.
         self.speed_refs = {}
@@ -414,15 +425,23 @@ class Macro:
         log("capture stream stalled, attempting recovery...")
         self._stream.stop()
 
-        if self.adb.reconnect():
+        # Kick the transport FIRST (force: a USB link can wedge while still
+        # listing as connected -- the plain check was a no-op for USB), then
+        # kill the device-side screenrecord over the now-working shell: it
+        # survives our end of the pipe dying and keeps the hardware encoder
+        # claimed, which is exactly what starves every relaunch of frames
+        # (and, stacked up, can freeze the phone itself).
+        if self.adb.reconnect(force=True):
             log("  ADB reconnected")
         else:
             log("  ADB reconnect failed, trying stream anyway...")
+        capture.kill_device_screenrecord(self.adb.adb_exe, self.adb.device)
+        time.sleep(1.0)                    # let the encoder release
 
         log("  re-establishing capture stream...")
         stream = capture.open_stream(
             self.adb.adb_exe, self.adb.device,
-            attempts=3, per_attempt_timeout=4.0, on_log=log)
+            attempts=3, per_attempt_timeout=6.0, on_log=log)
         if stream is None:
             log("  stream recovery failed")
             return None
@@ -666,6 +685,28 @@ class Macro:
             self._move_action = None
             log("  (armed: move when the first skill selection ends)")
 
+    def _count_plant_round(self):
+        """Count a completed Plant Defense round (challenge-ended seen).  The
+        end screen matches on several polls while it is being dismissed; the
+        debounce collapses those sightings into one round."""
+        if config.GAME_MODE != "plant":
+            return
+        now = time.time()
+        if now - self._plant_round_end_ts < PLANT_ROUND_DEBOUNCE:
+            return
+        self._plant_round_end_ts = now
+        self._plant_rounds_played += 1
+        limit = config.PLANT_ROUNDS or 0
+        suffix = f"/{limit}" if limit else ""
+        log(f"  (plant round {self._plant_rounds_played}{suffix} complete)")
+
+    def _plant_rounds_done(self):
+        """True when the configured round count is reached (0 = unlimited),
+        so the run should stop instead of starting another round."""
+        limit = config.PLANT_ROUNDS or 0
+        return bool(config.GAME_MODE == "plant" and limit
+                    and self._plant_rounds_played >= limit)
+
     # ------------------------------------------------------------------
     # One iteration
     # ------------------------------------------------------------------
@@ -771,6 +812,7 @@ class Macro:
         c3name, c3conf, _ = self._detect(image, self.challenge_ended_continue)
         if c3conf >= config.REF_THRESHOLD:
             self._plant_round_done = True
+            self._count_plant_round()
             bname, bconf, bcenter = self._detect(image, self.continue_button)
             if bconf >= config.REF_THRESHOLD and bcenter is not None:
                 log(f"challenge ended [{c3name} {c3conf:.2f}] -> Continue "
@@ -784,6 +826,7 @@ class Macro:
         cname, cconf, _ = self._detect(image, self.challenge_ended)
         if cconf >= config.REF_THRESHOLD:
             self._plant_round_done = True
+            self._count_plant_round()
             log(f"challenge ended [{cname} {cconf:.2f}] -> dismiss (centre tap)")
             time.sleep(rand_delay(config.ACTION_DELAY))
             self._tap(round(w * 0.50), round(h * 0.50), "dismiss results")
@@ -832,6 +875,14 @@ class Macro:
                     return "plant_back"
                 log("round done but back-plant-level button not visible; "
                     "starting without the level correction")
+            # Round limit: after the back-tap above has corrected the level,
+            # stop instead of starting a round past the configured count.
+            if (self._plant_rounds_done()
+                    and any(bname.startswith(p) for p in PLANT_START_BUTTONS)):
+                log(f"plant round limit reached "
+                    f"({self._plant_rounds_played}/{config.PLANT_ROUNDS}) -- "
+                    f"not starting another round")
+                return "rounds_done"
             log(f"button '{bname}' (conf {bconf:.2f}) -> tap")
             self._tap(bcenter[0], bcenter[1], bname)
             self._maybe_arm_movement(bname)
@@ -849,6 +900,13 @@ class Macro:
         for name, tpl, zone in self.custom_refs:
             conf, center = self._match_in_zone(image, tpl, zone)
             if conf >= config.REF_THRESHOLD and center is not None:
+                if (self._plant_rounds_done()
+                        and any(name.startswith(p)
+                                for p in PLANT_START_BUTTONS)):
+                    log(f"plant round limit reached "
+                        f"({self._plant_rounds_played}/{config.PLANT_ROUNDS}) "
+                        f"-- not starting another round")
+                    return "rounds_done"
                 log(f"custom button '{name}' (conf {conf:.2f}) -> tap")
                 self._tap(center[0], center[1], f"custom: {name}")
                 self._maybe_arm_movement(name)
@@ -1045,6 +1103,7 @@ def run_macro(stop_event=None):
 
     timed_out = False
     stuck_out = False
+    rounds_out = False
     last_state = None
     consec_black = 0
     BLACK_GIVE_UP = 40   # stop only after a long unbroken run of black frames
@@ -1064,6 +1123,10 @@ def run_macro(stop_event=None):
             try:
                 state = macro.step()
                 consec_black = 0
+
+                if state == "rounds_done":
+                    rounds_out = True
+                    break
 
                 if stuck_timeout and state not in ("idle", "blank"):
                     now = time.monotonic()
@@ -1117,7 +1180,7 @@ def run_macro(stop_event=None):
     if stream is not None:
         stream.stop()
 
-    if timed_out or stuck_out:
+    if timed_out or stuck_out or rounds_out:
         if config.SLEEP_PHONE_ON_TIMEOUT:
             adb_client.sleep_phone()
         if config.CLOSE_ON_TIMEOUT:

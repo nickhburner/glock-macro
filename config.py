@@ -342,6 +342,7 @@ MOVEMENT_CUSTOM  = (0.0, 1.0, 180.0, 1.0)
 # every movement scales together when T is adjusted.
 # angle convention: 0=right, 90=up, 180=left, 270=down.
 PLANT_SPAWN           = 1      # 1 = spawn left, 2 = spawn right (set in GUI)
+PLANT_ROUNDS          = 10     # stop after this many completed rounds (0 = unlimited)
 MOVEMENT_PLANT_PRESET = "top"   # direction: top / bottom / left / right
 MOVEMENT_PLANT_T      = 0.3    # seconds per unit; tune once, all durations scale
 
@@ -634,7 +635,7 @@ PERSISTED_KEYS = (
     "FAST_TAP_ENABLED", "FAST_TAP_HOLD", "FAST_TAP_TRANSFORM",
     "ALL_STAR_PAUSE_ON_3RD_DEATH", "ALL_STAR_HP_FULL_FRAC", "ALL_STAR_HP_EMPTY_FRAC",
     "MOVEMENT_MODE", "MOVEMENT_CHAPTER", "MOVEMENT_PLANT_PRESET", "MOVEMENT_PLANT_T",
-    "PLANT_SPAWN",
+    "PLANT_SPAWN", "PLANT_ROUNDS",
     "MOVEMENT_CUSTOM",
     "MOVEMENT_JOYSTICK_X_RATIO", "MOVEMENT_JOYSTICK_Y_RATIO",
     "MOVEMENT_SWIPE_LEN_RATIO",

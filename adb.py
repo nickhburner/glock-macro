@@ -633,12 +633,18 @@ class ADBClient:
             _run([self._adb, "disconnect", self._device], timeout=5)
         self._device = None
 
-    def reconnect(self) -> bool:
+    def reconnect(self, force: bool = False) -> bool:
         """Full disconnect + reconnect cycle for the current device.
 
         TCP devices: issues ``adb disconnect`` then ``adb connect`` so a
-        stale/hung connection is torn down before retrying. USB devices:
-        just re-verifies reachability (the OS handles the physical link).
+        stale/hung connection is torn down before retrying. USB devices: by
+        default just re-verifies reachability (the OS handles the physical
+        link); with ``force`` it issues ``adb reconnect`` to kick the
+        host-side transport and waits for the device to re-enumerate -- a USB
+        link can wedge (streams stall, shell commands hang) while the device
+        still LISTS as connected, so verification alone fixes nothing. Stream
+        recovery uses force; routine command retries should not (the kick
+        costs a few seconds of connectivity).
 
         Returns True if the device came back online and is ready.
         """
@@ -655,6 +661,17 @@ class ADBClient:
                 self._adb_connect(serial)
             except ADBError:
                 return False
+        elif force:
+            try:
+                self._run_cmd(["reconnect"], timeout=5)
+            except Exception:
+                pass
+            deadline = time.time() + 8.0   # USB re-enumeration takes a few s
+            while time.time() < deadline:
+                if self.is_connected():
+                    return True
+                time.sleep(0.5)
+            return False
         return self.is_connected()
 
     @property
