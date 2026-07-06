@@ -49,16 +49,6 @@ MOVEMENT_START_BUTTONS = (
     "start_challenge", "start-challenge",
 )
 
-# Plant Defense spawn is determined by HOW the match was entered, not by image
-# detection: the host starts the match (start_challenge) and always spawns in
-# position 1 (left); a guest joins and enters via get-ready, spawning in
-# position 2 (right).  Maps a start-button name prefix -> spawn; _maybe_arm_
-# movement records it so _do_movement can pick the matching path.
-PLANT_SPAWN_BY_START = (
-    ("start_challenge", 1), ("start-challenge", 1),
-    ("get-ready", 2),
-)
-
 # Max taps on the co-op Like button per round.  The pressed (inactive) button
 # can still resemble the template, so without a cap the macro could sit on the
 # results screen tapping Like forever instead of advancing.  Resets whenever a
@@ -287,9 +277,6 @@ class Macro:
         self._move_armed = False
         self._move_in_skill = False
         self._move_action = None        # None / "move"
-        # Plant Defense spawn (1=host/left, 2=guest/right), set from the start
-        # button in _maybe_arm_movement and consumed by _do_movement.
-        self._plant_spawn = 1
 
         # Active skill categories with avoid filtering.
         avoid_hashes = set()
@@ -640,12 +627,12 @@ class Macro:
         at the bottom centre) for each of the mode's two vectors.  Assumes the
         caller has already set 1x speed.  (w, h) are the normalised frame dims."""
         if config.MOVEMENT_MODE == 2:
-            # Plant Defense: spawn was determined by the entry button (host vs
-            # guest), recorded in self._plant_spawn -- no image detection needed.
-            spawn = self._plant_spawn
+            # Plant Defense: spawn side is set by the user (username
+            # alphabetical order decides it in-game, which we cannot read).
+            spawn = config.PLANT_SPAWN
             params = config.plant_movement(spawn)
             label = (f"plant defense  spawn {spawn} "
-                     f"({'host/left' if spawn == 1 else 'guest/right'}) / "
+                     f"({'left' if spawn == 1 else 'right'}) / "
                      f"{config.MOVEMENT_PLANT_PRESET}")
         else:
             params = {1: config.MOVEMENT_CHAPTER,
@@ -677,15 +664,6 @@ class Macro:
             self._move_armed = True
             self._move_in_skill = False
             self._move_action = None
-            # Plant Defense: the start button also tells us the spawn position
-            # (host via start_challenge = 1/left, guest via get-ready = 2/right).
-            for prefix, spawn in PLANT_SPAWN_BY_START:
-                if name.startswith(prefix):
-                    self._plant_spawn = spawn
-                    log(f"  (plant spawn {spawn} = "
-                        f"{'host/left' if spawn == 1 else 'guest/right'}, "
-                        f"from '{name}')")
-                    break
             log("  (armed: move when the first skill selection ends)")
 
     # ------------------------------------------------------------------
@@ -912,7 +890,8 @@ def run_plant_movement(adb_client, spawn=1, on_log=None):
     """Execute the configured Plant Defense movement for a given spawn, in real
     device pixels. Called by the GUI 'Conduct Movement' button so the user can
     test and tune the movement (and verify each spawn's path) outside of a full
-    macro run. In a real run the spawn comes from the entry button instead.
+    macro run. In a real run the spawn comes from config.PLANT_SPAWN (the
+    GUI Spawn Side toggle) instead.
 
     The joystick start and swipe length are derived from the device resolution
     (config.PHONE_RESOLUTION), so no frame capture is needed."""
@@ -925,7 +904,7 @@ def run_plant_movement(adb_client, spawn=1, on_log=None):
     params = config.plant_movement(spawn)
     angle1, dur1, angle2, dur2 = params
     _log(f"plant movement: preset={config.MOVEMENT_PLANT_PRESET} "
-         f"spawn={spawn} ({'host/left' if spawn == 1 else 'guest/right'}) "
+         f"spawn={spawn} ({'left' if spawn == 1 else 'right'}) "
          f"T={config.MOVEMENT_PLANT_T}s  "
          f"({angle1:.0f}°×{dur1:.2f}s, {angle2:.0f}°×{dur2:.2f}s)")
 

@@ -886,6 +886,42 @@ class App:
             fg=self.theme["fg_dim"])
         self._plant_dpad.pack(anchor="w", pady=(4, 4))
 
+        # Spawn side: the game seats the two co-op players by username
+        # alphabetical order, which the macro cannot read, so the user picks
+        # their side here (constant for a session with the same partner).
+        self._gm_plant_spawn_sub = RoundedSection(
+            self._gm_plant_frame, title="SPAWN SIDE",
+            bg=self.theme["surface_2"],
+            border_color=self.theme["border"],
+            title_fg=self.theme["fg_dim"], radius=6)
+        self._gm_plant_spawn_sub.pack(fill="x", pady=(4, 0))
+        self.plant_spawn_bool = tk.BooleanVar(value=config.PLANT_SPAWN == 2)
+        self._plant_spawn_toggle = SegmentToggle(
+            self._gm_plant_spawn_sub.inner,
+            variable=self.plant_spawn_bool,
+            command=self._on_plant_spawn,
+            labels=("Left", "Right"),
+            left_color=self.theme["accent"],
+            right_color=self.theme["accent"],
+            container_bg=self.theme["inset"],
+            label_fg=self.theme["fg_dim"],
+            outline=self.theme["border"],
+            canvas_bg=self.theme["surface_2"])
+        self._plant_spawn_toggle.pack(anchor="w", pady=(4, 2))
+        Tooltip(self._plant_spawn_toggle,
+                "Which side YOUR character spawns on. The game decides this "
+                "by the alphabetical order of the two usernames (not by who "
+                "hosts), so it stays the same all session with the same "
+                "partner. If unsure, watch where you spawn in the first "
+                "round and set it here.")
+        self._plant_spawn_hint = tk.Label(
+            self._gm_plant_spawn_sub.inner,
+            foreground=self.theme["fg_muted"], bg=self.theme["surface_2"],
+            font=(ui_font(), 9), justify="left", wraplength=240,
+            text="Decided by username alphabetical order; "
+                 "check round 1 if unsure.")
+        self._plant_spawn_hint.pack(anchor="w", pady=(0, 4))
+
         # Eternal Lode sub-frame
         self._gm_eternal_frame = tk.Frame(
             self._gm_disclosure, bg=self.theme["surface"])
@@ -1269,6 +1305,9 @@ class App:
         return tile
 
     def _on_plant_dir(self):
+        self._schedule_autosave()
+
+    def _on_plant_spawn(self):
         self._schedule_autosave()
 
     # timeout card (stays on main view)
@@ -1900,7 +1939,8 @@ class App:
                                   title_fg=p["fg"],
                                   parent_bg=p["bg"])
         for attr in ("_inactive_section", "_active_section",
-                     "_gm_chapter_sub", "_gm_plant_sub"):
+                     "_gm_chapter_sub", "_gm_plant_sub",
+                     "_gm_plant_spawn_sub"):
             sec = getattr(self, attr, None)
             if sec is not None:
                 sec.update_colors(bg=p["surface_2"],
@@ -1910,6 +1950,11 @@ class App:
         # Re-theme segmented switches and direction pad
         if hasattr(self, "_chapter_toggle"):
             self._chapter_toggle.update_colors(
+                container_bg=p["inset"], label_fg=p["fg_dim"],
+                outline=p["border"], canvas_bg=p["surface_2"],
+                left_color=p["accent"], right_color=p["accent"])
+        if hasattr(self, "_plant_spawn_toggle"):
+            self._plant_spawn_toggle.update_colors(
                 container_bg=p["inset"], label_fg=p["fg_dim"],
                 outline=p["border"], canvas_bg=p["surface_2"],
                 left_color=p["accent"], right_color=p["accent"])
@@ -3485,8 +3530,9 @@ class App:
             slbl = ttk.Label(spawn_row, text="Test spawn:")
             slbl.pack(side="left")
             Tooltip(slbl, "Spawn to simulate for Conduct Movement. In a real "
-                          "run: host=1/left, guest=2/right.")
-            for val, text in ((1, "1 Host/Left"), (2, "2 Guest/Right")):
+                          "run the side comes from the Spawn Side toggle in "
+                          "the Plant Defense panel.")
+            for val, text in ((1, "1 Left"), (2, "2 Right")):
                 ttk.Radiobutton(spawn_row, text=text,
                                 variable=self.movement_plant_spawn_var,
                                 value=val).pack(side="left", padx=(6, 0))
@@ -3566,8 +3612,9 @@ class App:
         self.allstar_level_var.set(self._allstar_level_label())
         self.elim_bosses = self._normalized_elim_picks()
 
-        # Plant direction
+        # Plant direction + spawn side
         self.plant_dir_var.set(config.MOVEMENT_PLANT_PRESET)
+        self.plant_spawn_bool.set(config.PLANT_SPAWN == 2)
 
         # Movement vector fields
         for key in ("MOVEMENT_CHAPTER", "MOVEMENT_CUSTOM"):
@@ -3632,6 +3679,7 @@ class App:
         elif gm == "plant":
             out["MOVEMENT_MODE"] = 2
             out["MOVEMENT_PLANT_PRESET"] = self.plant_dir_var.get()
+            out["PLANT_SPAWN"] = 2 if self.plant_spawn_bool.get() else 1
         else:
             out["MOVEMENT_MODE"] = 0
 

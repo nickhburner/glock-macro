@@ -46,7 +46,9 @@ That is it. Press **Start**.
   works on a rooted BlueStacks instance.
 - **Automatic movement.** Configurable per-mode joystick movement after the
   first skill selection: timed chapter run, or directional Plant Defense
-  positioning (top/bottom/left/right, with automatic spawn-side detection).
+  positioning (top/bottom/left/right, with a Spawn Side toggle -- the game
+  seats co-op players by username alphabetical order, so set your side once
+  per partner).
 - **Plant Defense co-op helpers.** Gives your partner a like on the results
   screen, and when hosting, taps the back button after every completed round
   so the game's level auto-advance never moves you off your chosen level.
