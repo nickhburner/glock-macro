@@ -866,38 +866,52 @@ class App:
             canvas_bg=self.theme["surface_2"])
         self._chapter_toggle.pack(anchor="w", pady=(4, 4))
 
-        # Plant Defense: direction pad sub-section
+        # Plant Defense: ONE box holds all three controls side by side (the
+        # direction pad, spawn side and round limit).  Stacking them as
+        # separate boxes made the panel tall enough to push the skill
+        # categories off the bottom of the window.
         self._gm_plant_frame = tk.Frame(self._gm_disclosure,
                                         bg=self.theme["surface"],
                                         highlightthickness=0)
         self._gm_plant_sub = RoundedSection(
-            self._gm_plant_frame, title="DEFEND DIRECTION",
+            self._gm_plant_frame, title="PLANT DEFENSE",
             bg=self.theme["surface_2"],
             border_color=self.theme["border"],
             title_fg=self.theme["fg_dim"], radius=6)
         self._gm_plant_sub.pack(fill="x", pady=(4, 0))
+        plant_row = tk.Frame(self._gm_plant_sub.inner,
+                             bg=self.theme["surface_2"])
+        plant_row.pack(anchor="w", fill="x", pady=(4, 4))
+
+        def _plant_caption(parent, text):
+            return tk.Label(parent, text=text,
+                            foreground=self.theme["fg_dim"],
+                            bg=self.theme["surface_2"],
+                            font=(ui_font(), 8, "bold"))
+
+        # Defend direction
+        dir_col = tk.Frame(plant_row, bg=self.theme["surface_2"])
+        dir_col.pack(side="left", anchor="n")
+        _plant_caption(dir_col, "DEFEND DIRECTION").pack(anchor="w")
         self.plant_dir_var = tk.StringVar(value=config.MOVEMENT_PLANT_PRESET)
         self._plant_dpad = DirectionPad(
-            self._gm_plant_sub.inner, variable=self.plant_dir_var,
+            dir_col, variable=self.plant_dir_var,
             command=self._on_plant_dir,
             bg=self.theme["surface_2"],
             selected_color=self.theme["accent"],
             unselected_color=self.theme["surface_3"],
             fg=self.theme["fg_dim"])
-        self._plant_dpad.pack(anchor="w", pady=(4, 4))
+        self._plant_dpad.pack(anchor="w", pady=(2, 0))
 
         # Spawn side: the game seats the two co-op players by username
         # alphabetical order, which the macro cannot read, so the user picks
         # their side here (constant for a session with the same partner).
-        self._gm_plant_spawn_sub = RoundedSection(
-            self._gm_plant_frame, title="SPAWN SIDE",
-            bg=self.theme["surface_2"],
-            border_color=self.theme["border"],
-            title_fg=self.theme["fg_dim"], radius=6)
-        self._gm_plant_spawn_sub.pack(fill="x", pady=(4, 0))
+        spawn_col = tk.Frame(plant_row, bg=self.theme["surface_2"])
+        spawn_col.pack(side="left", anchor="n", padx=(16, 0))
+        _plant_caption(spawn_col, "SPAWN SIDE").pack(anchor="w")
         self.plant_spawn_bool = tk.BooleanVar(value=config.PLANT_SPAWN == 2)
         self._plant_spawn_toggle = SegmentToggle(
-            self._gm_plant_spawn_sub.inner,
+            spawn_col,
             variable=self.plant_spawn_bool,
             command=self._on_plant_spawn,
             labels=("Left", "Right"),
@@ -907,36 +921,25 @@ class App:
             label_fg=self.theme["fg_dim"],
             outline=self.theme["border"],
             canvas_bg=self.theme["surface_2"])
-        self._plant_spawn_toggle.pack(anchor="w", pady=(4, 2))
+        self._plant_spawn_toggle.pack(anchor="w", pady=(4, 0))
         Tooltip(self._plant_spawn_toggle,
                 "Which side YOUR character spawns on. The game decides this "
                 "by the alphabetical order of the two usernames (not by who "
                 "hosts), so it stays the same all session with the same "
                 "partner. If unsure, watch where you spawn in the first "
                 "round and set it here.")
-        self._plant_spawn_hint = tk.Label(
-            self._gm_plant_spawn_sub.inner,
-            foreground=self.theme["fg_muted"], bg=self.theme["surface_2"],
-            font=(ui_font(), 9), justify="left", wraplength=240,
-            text="Decided by username alphabetical order; "
-                 "check round 1 if unsure.")
-        self._plant_spawn_hint.pack(anchor="w", pady=(0, 4))
 
         # Round limit: play this many full rounds of the level, then stop.
-        self._gm_plant_rounds_sub = RoundedSection(
-            self._gm_plant_frame, title="ROUNDS",
-            bg=self.theme["surface_2"],
-            border_color=self.theme["border"],
-            title_fg=self.theme["fg_dim"], radius=6)
-        self._gm_plant_rounds_sub.pack(fill="x", pady=(4, 0))
-        rounds_row = tk.Frame(self._gm_plant_rounds_sub.inner,
-                              bg=self.theme["surface_2"])
-        rounds_row.pack(anchor="w", pady=(4, 4))
+        rounds_col = tk.Frame(plant_row, bg=self.theme["surface_2"])
+        rounds_col.pack(side="left", anchor="n", padx=(16, 0))
+        _plant_caption(rounds_col, "ROUNDS").pack(anchor="w")
+        rounds_row = tk.Frame(rounds_col, bg=self.theme["surface_2"])
+        rounds_row.pack(anchor="w", pady=(4, 0))
         self.plant_rounds_var = tk.StringVar(value=str(config.PLANT_ROUNDS))
-        rounds_entry = ttk.Entry(rounds_row, width=6,
+        rounds_entry = ttk.Entry(rounds_row, width=5,
                                  textvariable=self.plant_rounds_var)
         rounds_entry.pack(side="left")
-        tk.Label(rounds_row, text="rounds, then stop (0 = unlimited)",
+        tk.Label(rounds_row, text="0 = unlimited",
                  foreground=self.theme["fg_muted"], bg=self.theme["surface_2"],
                  font=(ui_font(), 9)).pack(side="left", padx=(6, 0))
         Tooltip(rounds_entry,
@@ -1963,8 +1966,7 @@ class App:
                                   title_fg=p["fg"],
                                   parent_bg=p["bg"])
         for attr in ("_inactive_section", "_active_section",
-                     "_gm_chapter_sub", "_gm_plant_sub",
-                     "_gm_plant_spawn_sub", "_gm_plant_rounds_sub"):
+                     "_gm_chapter_sub", "_gm_plant_sub"):
             sec = getattr(self, attr, None)
             if sec is not None:
                 sec.update_colors(bg=p["surface_2"],
