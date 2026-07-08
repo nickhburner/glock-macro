@@ -41,9 +41,13 @@ That is it. Press **Start**.
 - **Smart skill selection.** Prioritise skill categories by drag order, pin
   specific must-have skills (Custom Priority), and blacklist skills to never
   take (Avoid list). Rerolls automatically when no wanted skill is showing.
+- **Per-mode skill profiles.** "Save to game mode" stores the current active
+  categories, custom priority and avoid lists for the selected game mode, and
+  reapplies them automatically whenever you switch back to that mode.
 - **Multiple game modes:** Chapter, Plant Defense, Shackled Jungle, Eternal
   Lode, and All-Star Cup, each with mode-specific options. All-Star Cup ONLY
-  works on a rooted BlueStacks instance.
+  works on a rooted BlueStacks instance. Switching mode while the macro is
+  running takes effect on the next Start (the current run is never disturbed).
 - **Automatic movement.** Configurable per-mode joystick movement after the
   first skill selection: timed chapter run, or directional Plant Defense
   positioning (top/bottom/left/right, with a Spawn Side toggle -- the game
@@ -59,6 +63,10 @@ That is it. Press **Start**.
   and more. Clicked automatically whenever seen.
 - **Custom buttons.** Capture any extra on-screen button (e.g. an event banner)
   via ADB screenshot crop; the macro clicks it on sight.
+- **Languages.** English, French, and German. Pick the display language in
+  Settings (the UI relabels on the next app start). If you play the game in
+  French or German, the "Language refs" wizard walks you through recapturing
+  the few text-bearing buttons in your language so detection keeps working.
 - **Streaming capture.** Frames come from a continuous `screenrecord` H.264
   stream (decoded with PyAV), not per-poll screenshots. Faster and avoids
   BlueStacks black-frame issues.
@@ -67,6 +75,11 @@ That is it. Press **Start**.
 - **Run timeout.** Automatically stop after a set duration; optionally close the
   game window and/or sleep the phone.
 - **Humanised input.** Tap jitter and timing randomisation.
+- **Root fast input (optional).** On a rooted BlueStacks (or any device with a
+  writable `/dev/input`), route all taps through the low-latency `sendevent`
+  path used by All-Star. An optional "Humanized taps" toggle adds gaussian
+  position jitter, randomised hold time and micro-drift (it slows All-Star, so
+  it is off by default). Both live under Settings > Fast input.
 - **Dark / light theme.**
 - **Autosave.** Settings persist to `settings.json` automatically or on demand.
 - **Global hotkey.** Press ``Ctrl+` `` at any time (any window focused) to
@@ -84,7 +97,8 @@ That is it. Press **Start**.
 
 Run `A2 Updater.exe` (it sits next to the main exe). It checks GitHub for the
 latest release, downloads it, and applies it in place. Your `settings.json`,
-custom buttons, and match zones are never touched. Close the main app first.
+custom buttons, captured language refs (`ref/fr`, `ref/de`), match zones, and
+remote pairing token are never touched. Close the main app first.
 
 ## Good to know
 
@@ -108,5 +122,46 @@ To build the standalone `.exe`:
 build.bat
 ```
 
-The output goes to `dist/`. Copy `skills/`, `ref/`, and `README.md` alongside
-the `.exe` (the build script does this automatically).
+The output goes to `dist/`. The build script also copies `skills/`, `ref/`,
+`lang/`, `version.txt`, and `README.md` alongside the `.exe` automatically, and
+builds `A2 Updater.exe` and `A2 Remote.exe`.
+
+## Remote status and control (optional)
+
+Watch the macro's status and log from your phone, and press Start / Stop /
+Sleep phone / Close BlueStacks from anywhere. **Off by default**; nothing
+remote exists until you switch it on.
+
+How it works: the main app never touches the internet. While the feature is
+enabled, a small companion (`A2 Remote.exe`, sitting next to the main exe)
+pushes the status **outbound over HTTPS** to a tiny relay running on *your
+own* free Cloudflare account, and a static web page (hosted on *your own*
+GitHub Pages) shows it. No ports are opened on your PC or router, and no
+third-party service of ours is involved: you run both halves yourself.
+
+One-time setup, three steps:
+
+1. **Deploy the relay** to your Cloudflare account: follow
+   `remote/worker/DEPLOY.md` (about 10 minutes, copy-paste commands).
+2. **Deploy the web page** to GitHub Pages: follow `remote/pages/DEPLOY.md`
+   (a single file upload). The `remote/` folder is in the source repository,
+   not in the installed app folder.
+3. **Enable and pair:** in the app's Remote panel, paste both URLs, switch
+   the feature on, press **Copy pairing link**, and open that link once on
+   your phone.
+
+The security model in plain words:
+
+- On first enable the app creates a random secret (`remote_token.txt`) that
+  never leaves your machines: it travels only inside the pairing link, in
+  the part after `#`, which browsers do not send to any server.
+- Everything is signed with that secret, end to end. The relay only stores
+  the latest status for a few minutes and a pending command for one minute;
+  it never sees the secret, so it **cannot** control your PC, and neither
+  can anyone else without your pairing link.
+- Commands expire after 60 seconds and cannot be replayed; the PC only
+  accepts the four built-in commands, nothing else.
+- If a pairing link ever leaks, press **Regenerate token**: every old link
+  stops working instantly.
+- Turning the feature off stops the companion; the main app itself has no
+  network code at all.

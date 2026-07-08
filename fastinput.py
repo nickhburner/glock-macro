@@ -55,6 +55,7 @@ from __future__ import annotations
 
 import logging
 import queue
+import random
 import re
 import subprocess
 import threading
@@ -91,6 +92,22 @@ _BTN_TOUCH = 0x14a
 # sendevent cannot take a negative value; the type-B "lift" tracking id (-1) is
 # sent as its unsigned 32-bit form.
 _TRACKING_ID_UP = 4294967295
+
+# ---- Humanization tuning (used only when the humanize flag is on) -------------
+# A tap gets a small gaussian position jitter, a randomised press hold, a few
+# intermediate "drift" move events between down and up, and a small random pause
+# just before it fires.  These keep the injected taps from being pixel-perfect
+# and metronome-timed.  The verdict from the interview was hold + jitter + timing
+# only (no pressure curves / bezier paths), so these are all this needs.
+_HUMAN_POS_SIGMA_PX  = 2.0     # gaussian stddev of the position jitter, in px
+_HUMAN_POS_CLAMP_PX  = 5       # hard cap on the position jitter magnitude, in px
+_HUMAN_HOLD_MIN      = 0.060   # shortest press hold (down -> up), seconds
+_HUMAN_HOLD_MAX      = 0.120   # longest press hold, seconds
+_HUMAN_DRIFT_MIN     = 1       # fewest intermediate move events during the hold
+_HUMAN_DRIFT_MAX     = 3       # most intermediate move events during the hold
+_HUMAN_DRIFT_PX      = 3       # max per-axis px offset of a drift move from target
+_HUMAN_PRETAP_MIN    = 0.0     # shortest extra pause before a tap fires, seconds
+_HUMAN_PRETAP_MAX    = 0.040   # longest extra pause before a tap fires, seconds
 
 
 class FastTapError(Exception):
@@ -146,6 +163,11 @@ class FastTapper:
         # default is 0.  A positive value inserts an on-device `sleep` between
         # down and up for devices that need a longer press.
         self._hold = 0.0
+        # When True, tap() adds human-like variance (position jitter, randomised
+        # hold, micro-drift move events, pre-tap timing jitter).  Set by setup()
+        # from the caller's humanize flag; ignored on the adb.tap fallback path,
+        # which is a plain tap.
+        self._humanize = False
 
         # Self-healing: the persistent shell can occasionally be dropped (for
         # example when another adb shell command runs near it).  _write restarts
@@ -174,19 +196,30 @@ class FastTapper:
     # Setup
     # ------------------------------------------------------------------
 
-    def setup(self, width: int, height: int, on_log=None) -> bool:
+    def setup(self, width: int, height: int, on_log=None,
+              enabled: Optional[bool] = None, humanize: bool = False) -> bool:
         """Probe the device, choose a transform, and start the shell.
+
+        `enabled` is the caller's on/off decision for the fast path; when None it
+        falls back to config.FAST_TAP_ENABLED.  This is how the two fast-tap
+        toggles stay separate: All-Star passes config.FAST_TAP_ENABLED (its own
+        gate, unchanged), while chapter / plant / eternal pass
+        config.ROOT_FAST_INPUT.  `humanize` turns on per-tap human-like variance
+        (see tap()); pass config.HUMANIZED_TAPS.
 
         Returns True if the fast path is ready, False to fall back to adb.tap.
         Never raises: any failure just disables the fast path.
         """
         say = on_log or (lambda *_: None)
         import config
-        if not getattr(config, "FAST_TAP_ENABLED", True):
+        if enabled is None:
+            enabled = getattr(config, "FAST_TAP_ENABLED", True)
+        if not enabled:
             say("fast-tap: disabled in settings; using adb input tap")
             return False
         self._w, self._h = int(width), int(height)
         self._hold = float(getattr(config, "FAST_TAP_HOLD", 0.0))
+        self._humanize = bool(humanize)
         try:
             if not self._probe_touch_device():
                 say("fast-tap: no touchscreen event node found; using adb input tap")
@@ -206,7 +239,8 @@ class FastTapper:
         say(f"fast-tap: ON  node={self.node} name={self.name!r} "
             f"type={'B' if self.type_b else 'A'} "
             f"range=({self.x_max},{self.y_max}) transform={self.transform} "
-            f"hold={self._hold * 1000:.0f}ms")
+            f"hold={self._hold * 1000:.0f}ms "
+            f"humanize={'on' if self._humanize else 'off'}")
         return True
 
     def _probe_touch_device(self) -> bool:
@@ -424,6 +458,23 @@ class FastTapper:
         ev.append((_EV_SYN, _SYN_REPORT, 0))
         return ev
 
+    def _move_events(self, ex: int, ey: int):
+        """Mid-touch position update (a drift move during the hold), reusing the
+        active contact.  Type A re-reports X/Y then SYN_MT_REPORT/SYN_REPORT;
+        type B updates the slot's X/Y (no new tracking id) then SYN_REPORT."""
+        if not self.type_b:
+            return [(_EV_ABS, _ABS_MT_POSITION_X, ex),
+                    (_EV_ABS, _ABS_MT_POSITION_Y, ey),
+                    (_EV_SYN, _SYN_MT_REPORT, 0),
+                    (_EV_SYN, _SYN_REPORT, 0)]
+        ev = []
+        if self.has_slot:
+            ev.append((_EV_ABS, _ABS_MT_SLOT, 0))
+        ev.append((_EV_ABS, _ABS_MT_POSITION_X, ex))
+        ev.append((_EV_ABS, _ABS_MT_POSITION_Y, ey))
+        ev.append((_EV_SYN, _SYN_REPORT, 0))
+        return ev
+
     def _cmd(self, events) -> str:
         node = self.node
         return "".join(f"sendevent {node} {t} {c} {v};" for (t, c, v) in events)
@@ -460,14 +511,23 @@ class FastTapper:
         an ack marker so the tap has actually landed before returning.  This
         keeps the call synchronous like the old `adb input tap`, so a spam loop
         never builds a backlog and stops tapping the instant it is told to.
+
+        When humanization is on (see setup(humanize=...)) the tap instead gets a
+        small gaussian position jitter, a randomised 60-120ms hold with 1-3
+        intermediate micro-drift move events, and a small random pre-tap pause,
+        so the injected taps are not pixel-perfect or metronome-timed.
+
         Raises FastTapError if the shell has failed; the caller should then fall
         back to adb.tap.
         """
-        ex, ey = self._to_event(sx, sy)
-        line = self._cmd(self._down_events(ex, ey))
-        if self._hold > 0:
-            line += f"sleep {self._hold:.3f};"
-        line += self._cmd(self._up_events())
+        if self._humanize:
+            line = self._humanized_line(sx, sy)
+        else:
+            ex, ey = self._to_event(sx, sy)
+            line = self._cmd(self._down_events(ex, ey))
+            if self._hold > 0:
+                line += f"sleep {self._hold:.3f};"
+            line += self._cmd(self._up_events())
         line += "echo " + _ACK_MARKER.decode() + "\n"
         with self._lock:
             # Drop any stale ack from a prior tap that timed out, so we wait for
@@ -486,6 +546,48 @@ class FastTapper:
                     q.get(timeout=_ACK_TIMEOUT)
                 except queue.Empty:
                     pass               # best effort: the tap most likely landed
+
+    def _humanized_line(self, sx: int, sy: int) -> str:
+        """Build the sendevent command line for one human-like tap.
+
+        Position gets a clamped gaussian jitter; the press is held for a random
+        60-120ms with 1-3 intermediate drift move events, each nudged a couple of
+        px off the (jittered) target; and a small pre-tap pause is inserted on the
+        device before the press.  All timing is expressed as on-device `sleep`
+        commands so the whole tap is still one write to the shell.  The ack marker
+        is appended by the caller.
+        """
+        # Position jitter around the screen-space target, clamped, then mapped to
+        # event space (the transform + bounds clamp live in _to_event).
+        def jitter(v):
+            off = int(round(random.gauss(0.0, _HUMAN_POS_SIGMA_PX)))
+            off = max(-_HUMAN_POS_CLAMP_PX, min(_HUMAN_POS_CLAMP_PX, off))
+            return v + off
+
+        tx, ty = jitter(sx), jitter(sy)
+        ex, ey = self._to_event(tx, ty)
+
+        pretap = random.uniform(_HUMAN_PRETAP_MIN, _HUMAN_PRETAP_MAX)
+        hold = random.uniform(_HUMAN_HOLD_MIN, _HUMAN_HOLD_MAX)
+        n_drift = random.randint(_HUMAN_DRIFT_MIN, _HUMAN_DRIFT_MAX)
+
+        line = ""
+        if pretap > 0:
+            line += f"sleep {pretap:.3f};"
+        line += self._cmd(self._down_events(ex, ey))
+        # Split the hold into n_drift+1 slices, emitting a drifted move between
+        # each.  Each drift is a few px off the jittered target (in screen space
+        # so it respects the transform), never leaving the tap area.
+        slice_hold = hold / (n_drift + 1)
+        for _ in range(n_drift):
+            line += f"sleep {slice_hold:.3f};"
+            dx = tx + random.randint(-_HUMAN_DRIFT_PX, _HUMAN_DRIFT_PX)
+            dy = ty + random.randint(-_HUMAN_DRIFT_PX, _HUMAN_DRIFT_PX)
+            mex, mey = self._to_event(dx, dy)
+            line += self._cmd(self._move_events(mex, mey))
+        line += f"sleep {slice_hold:.3f};"
+        line += self._cmd(self._up_events())
+        return line
 
     def release(self):
         """Send a touch-up (best effort), in case a press was left outstanding."""

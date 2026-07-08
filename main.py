@@ -20,6 +20,7 @@ from typing import Optional
 
 import capture
 import config
+import fastinput
 from adb import ADBClient, ADBError, BlackFrameError, choose_server_port
 from matcher import (
     crop_band,
@@ -88,6 +89,96 @@ def log(msg):
             _log_sink(line)
         except Exception:
             pass
+
+
+# ------------------------------------------------------------------
+# Activity summary (concise, deduplicated view of what the macro did)
+# ------------------------------------------------------------------
+# The verbose log() above is per-poll detail. This is the high-level story:
+# one line per round start / finish, and a single collapsing count of
+# consecutive skill selections. It feeds the remote check-in view, so a phone
+# glance reads "Started a new round [#5] / Made skill selection [x3]" instead
+# of scrolling raw taps.
+
+_activity_sink = None
+
+
+def set_activity_sink(sink):
+    """Install a callable that receives the activity entry list (a list of
+    strings) on every change, or None to remove it."""
+    global _activity_sink
+    _activity_sink = sink
+
+
+class _Activity:
+    MAX_ENTRIES = 40
+
+    def __init__(self):
+        self.entries = []        # rendered strings, oldest first
+        self._round = 0
+        self._skill_streak = 0
+        self._phase = "idle"     # "idle" | "playing"
+
+    def _emit(self):
+        if _activity_sink is not None:
+            try:
+                _activity_sink(list(self.entries))
+            except Exception:
+                pass
+
+    def _append(self, text):
+        self.entries.append(text)
+        if len(self.entries) > self.MAX_ENTRIES:
+            del self.entries[:-self.MAX_ENTRIES]
+
+    def _begin_round(self):
+        self._round += 1
+        self._skill_streak = 0
+        self._phase = "playing"
+        self._append(f"Started a new round [#{self._round}]")
+
+    def round_started(self):
+        # Dedup: the macro taps Start/Get-Ready on many polls until the screen
+        # changes; that is all one round.
+        if self._phase == "playing":
+            return
+        self._begin_round()
+        self._emit()
+
+    def skill_selected(self):
+        # A skill screen implies we are in a round even if the Start button was
+        # never seen (e.g. the macro was started mid-run).
+        if self._phase != "playing":
+            self._begin_round()
+        self._skill_streak += 1
+        line = ("Made skill selection"
+                if self._skill_streak == 1
+                else f"Made skill selection [x{self._skill_streak}]")
+        # Collapse consecutive picks into one running line.
+        if self.entries and self.entries[-1].startswith("Made skill selection"):
+            self.entries[-1] = line
+        else:
+            self._append(line)
+        self._emit()
+
+    def round_finished(self):
+        # Dedup: the end screen keeps matching across polls while dismissed.
+        if self._phase != "playing":
+            return
+        self._phase = "idle"
+        self._skill_streak = 0
+        self._append("Finished round")
+        self._emit()
+
+    def reset(self):
+        self.entries = []
+        self._round = 0
+        self._skill_streak = 0
+        self._phase = "idle"
+        self._emit()
+
+
+activity = _Activity()
 
 
 # ------------------------------------------------------------------
@@ -171,20 +262,24 @@ class Macro:
         # add them incrementally with the GUI "Capture ref" tool).
         self.refs = {}
         self.skill_banners = []
-        for key, path in (("refresh",  config.REF_REFRESH),
-                          ("valkyrie", config.REF_VALKYRIE),
-                          ("level",    config.REF_LEVEL),
-                          ("glory",    config.REF_GLORY),
-                          ("angel",    config.REF_ANGEL)):
+        for key, default_path in (("refresh",  config.REF_REFRESH),
+                                  ("valkyrie", config.REF_VALKYRIE),
+                                  ("level",    config.REF_LEVEL),
+                                  ("glory",    config.REF_GLORY),
+                                  ("angel",    config.REF_ANGEL)):
+            # Prefer the active-language variant (ref/<lang>/<name>.png) if the
+            # user captured one; else fall back to the bundled English ref. The
+            # match zone keys by the base filename regardless of language.
+            path = config.ref_path(default_path)
             if path.exists():
                 self.refs[key] = load_template(path)
-                self._ref_zone[key] = self._zones.get(path.name, "full")
+                self._ref_zone[key] = self._zones.get(default_path.name, "full")
                 if key != "refresh":
                     self.skill_banners.append(key)
             elif key == "refresh":
                 log("NOTE: refresh.png not captured; cannot reroll skills")
             else:
-                log(f"NOTE: skill banner '{path.name}' not captured yet, skipping")
+                log(f"NOTE: skill banner '{default_path.name}' not captured yet, skipping")
         if not self.skill_banners:
             log("WARNING: no skill-screen banners available, "
                 "skill selection will not be detected")
@@ -352,7 +447,34 @@ class Macro:
         if self.avoid_skills:
             log(f"loaded {len(self.avoid_skills)} avoid skill(s)")
 
+        # Low-latency tap injection (sendevent). Only wired up when the user
+        # turns on ROOT_FAST_INPUT; run_macro calls setup_fast_tap() once the
+        # device resolution is known. When it is off (or setup fails) _tap uses
+        # the ordinary adb.tap, exactly as before. This is separate from the
+        # All-Star FAST_TAP_ENABLED gate, which stays All-Star-only.
+        self._tapper = fastinput.FastTapper(adb_client)
+        self._fast_tap = False       # True once a fast tapper is set up and ready
+        self._fast_warned = False    # dedupe the adb.tap fallback log
+
         self._warn_blank_refs()
+
+    def setup_fast_tap(self, width, height):
+        """Bring up the sendevent fast tapper for this run if ROOT_FAST_INPUT is
+        on. Falls back silently to adb.tap on any failure. width/height are the
+        device's real pixel dimensions."""
+        if not getattr(config, "ROOT_FAST_INPUT", False):
+            return
+        self._fast_tap = self._tapper.setup(
+            width, height, on_log=log,
+            enabled=True,
+            humanize=getattr(config, "HUMANIZED_TAPS", False))
+
+    def close(self):
+        """Release any held touch and tear down the fast tapper."""
+        try:
+            self._tapper.close()
+        except Exception:                              # noqa: BLE001
+            pass
 
     def _warn_blank_refs(self):
         blank = [name for name, tpl in self.refs.items() if is_blank(tpl)]
@@ -367,13 +489,30 @@ class Macro:
 
     def _tap(self, x, y, label):
         """Send a tap.  (x, y) are in the normalised match space (MATCH_WIDTH);
-        convert to real device pixels via _norm, then add jitter + a pre-delay."""
+        convert to real device pixels via _norm, then add jitter + a pre-delay.
+
+        When ROOT_FAST_INPUT set up a fast tapper, the tap goes through it
+        (sendevent); on any fast-path failure it falls back to adb.tap for that
+        tap (a plain tap: fast-tapper humanization does not apply to the
+        fallback). The existing CLICK_JITTER / CLICK_DELAY_RANGE coordinate
+        humanisation is kept in both cases, unchanged."""
         dx = round(x / self._norm)
         dy = round(y / self._norm)
         jx = dx + random.randint(-config.CLICK_JITTER, config.CLICK_JITTER)
         jy = dy + random.randint(-config.CLICK_JITTER, config.CLICK_JITTER)
         log(f"  tap {label} @ ({jx}, {jy})")
         time.sleep(random.uniform(*config.CLICK_DELAY_RANGE))
+        if self._fast_tap and self._tapper.available:
+            try:
+                self._tapper.tap(jx, jy)
+                if self._fast_warned:
+                    log("  fast-tap recovered")
+                    self._fast_warned = False
+                return
+            except fastinput.FastTapError as exc:
+                if not self._fast_warned:    # log once per failure episode
+                    log(f"  fast-tap failed ({exc}); falling back to adb input tap")
+                    self._fast_warned = True
         self.adb.tap(jx, jy)
 
     # ------------------------------------------------------------------
@@ -487,8 +626,12 @@ class Macro:
                 p = config.REF_DIR / pat
                 paths = [p] if p.is_file() else []
             for p in paths:
+                # Glob resolves against the English ref/ set; swap in the
+                # active-language variant (ref/<lang>/<name>.png) if present.
+                # Zone still keys by the base filename regardless of language.
+                lp = config.ref_path(p)
                 try:
-                    out.append((p.stem, load_template(p),
+                    out.append((p.stem, load_template(lp),
                                 self._zones.get(p.name, "full")))
                 except (FileNotFoundError, ValueError):
                     log(f"NOTE: ref '{p.name}' could not load, skipping")
@@ -767,6 +910,7 @@ class Macro:
                 log(f"skill select [{indicator} {iconf:.2f}] -> "
                     f"{category} / {name} (conf {sconf:.2f})")
                 self._tap(scenter[0], scenter[1], f"skill {category}/{name}")
+                activity.skill_selected()
             else:
                 rconf, rcenter = (self._find_ref(image, "refresh")
                                   if "refresh" in self.refs else (-1.0, None))
@@ -774,6 +918,8 @@ class Macro:
                     log(f"skill select [{indicator} {iconf:.2f}] -> no wanted "
                         f"skill, refresh ({rconf:.2f}) -> reroll")
                     self._tap(rcenter[0], rcenter[1], "refresh")
+                    # A reroll is not a selection; the streak resumes on the
+                    # next screen's actual pick.
                 else:
                     # Slot layout depends on how many cards the screen shows:
                     # valkyrie/angel = 2 cards, level/glory = 3.  Tapping the
@@ -791,6 +937,7 @@ class Macro:
                         log(f"skill select [{indicator} {iconf:.2f}] -> no wanted "
                             f"skill, no refresh -> first slot")
                     self._tap(*slot, "fallback skill slot")
+                    activity.skill_selected()
             time.sleep(rand_delay(config.ACTION_DELAY))
             return "skill"
 
@@ -813,6 +960,7 @@ class Macro:
         if c3conf >= config.REF_THRESHOLD:
             self._plant_round_done = True
             self._count_plant_round()
+            activity.round_finished()
             bname, bconf, bcenter = self._detect(image, self.continue_button)
             if bconf >= config.REF_THRESHOLD and bcenter is not None:
                 log(f"challenge ended [{c3name} {c3conf:.2f}] -> Continue "
@@ -827,6 +975,7 @@ class Macro:
         if cconf >= config.REF_THRESHOLD:
             self._plant_round_done = True
             self._count_plant_round()
+            activity.round_finished()
             log(f"challenge ended [{cname} {cconf:.2f}] -> dismiss (centre tap)")
             time.sleep(rand_delay(config.ACTION_DELAY))
             self._tap(round(w * 0.50), round(h * 0.50), "dismiss results")
@@ -891,6 +1040,7 @@ class Macro:
                 # round-completed flag.
                 self._like_taps = 0
                 self._plant_round_done = False
+                activity.round_started()
             else:
                 self._plant_round_done = True
             time.sleep(rand_delay(config.ACTION_DELAY))
@@ -913,6 +1063,7 @@ class Macro:
                 if any(name.startswith(p) for p in MOVEMENT_START_BUTTONS):
                     self._like_taps = 0
                     self._plant_round_done = False
+                    activity.round_started()
                 else:
                     self._plant_round_done = True
                 time.sleep(rand_delay(config.ACTION_DELAY))
@@ -1005,6 +1156,7 @@ def run_macro(stop_event=None):
     if stop_event is None:
         stop_event = threading.Event()
 
+    activity.reset()            # fresh activity summary for this run
     log("A2 Macro Controller")
     log("active skill categories: "
         + (", ".join(config.ACTIVE_CATEGORIES) or "(none)"))
@@ -1033,9 +1185,11 @@ def run_macro(stop_event=None):
     # frame (not the flaky `wm size`, which returns empty on some emulators) and
     # rebuild the skill band / slot / game-over coords for the real size.  This
     # is what stops a stale PHONE_RESOLUTION from putting the band off-screen.
+    dev_wh = None
     try:
         probe = adb_client.screenshot()
         h, w = probe.shape[:2]
+        dev_wh = (w, h)
         config.PHONE_RESOLUTION = [w, h]
         config.resolve_geometry(w, h)   # device-space coords for the GUI/settings
         norm = config.MATCH_WIDTH / w if w else 1.0
@@ -1087,11 +1241,22 @@ def run_macro(stop_event=None):
             stream.stop()
         return
 
+    # Bring up the sendevent fast tapper if ROOT_FAST_INPUT is on (needs the
+    # device's real resolution from the probe; a no-op / silent fallback to
+    # adb.tap otherwise).
+    if dev_wh is not None:
+        macro.setup_fast_tap(dev_wh[0], dev_wh[1])
+    elif getattr(config, "ROOT_FAST_INPUT", False):
+        log("root fast input: skipped (device resolution unknown); using adb input tap")
+
     log(f"ADB ready, starting in {config.STARTUP_DELAY:.0f}s "
         f"(press the Stop button to stop)")
     _interruptible_sleep(config.STARTUP_DELAY, stop_event)
     if stop_event.is_set():
         log("stopped before the run started")
+        macro.close()
+        if stream is not None:
+            stream.stop()
         return
 
     timeout_hours = config.RUN_TIMEOUT_HOURS or 0
@@ -1177,6 +1342,7 @@ def run_macro(stop_event=None):
     except KeyboardInterrupt:
         log("stopped by user")
 
+    macro.close()
     if stream is not None:
         stream.stop()
 

@@ -567,12 +567,18 @@ class RoundedCheckbox(tk.Canvas):
 # ---- DirectionPad (2x2 grid of direction buttons) ----
 
 class DirectionPad(tk.Frame):
-    """A 2x2 grid of Top/Bottom/Left/Right buttons."""
+    """A 2x2 grid of Top/Bottom/Left/Right buttons.
+
+    ``labels`` maps the internal direction ids ("top" / "bottom" / "left" /
+    "right", which is what the bound variable stores) to the text drawn on
+    each button, so callers can pass translated labels without the stored
+    ids ever changing. Defaults to English.
+    """
 
     def __init__(self, parent, variable=None, command=None,
                  bg="#1a1b1f", selected_color="#5b86e8",
                  unselected_color="#31343c", fg="#e7e8ec",
-                 radius=6, **kw):
+                 radius=6, labels=None, **kw):
         super().__init__(parent, bg=bg, highlightthickness=0, bd=0, **kw)
         self._var = variable
         self._command = command
@@ -582,6 +588,8 @@ class DirectionPad(tk.Frame):
         self._radius = radius
         self._bg = bg
         self._buttons = {}
+        self._dir_labels = labels or {"top": "Top", "bottom": "Bottom",
+                                      "left": "Left", "right": "Right"}
 
         dirs = [("top", 0, 0), ("bottom", 0, 1),
                 ("left", 1, 0), ("right", 1, 1)]
@@ -612,8 +620,7 @@ class DirectionPad(tk.Frame):
 
     def _redraw(self):
         current = self._var.get() if self._var else ""
-        labels = {"top": "Top", "bottom": "Bottom",
-                  "left": "Left", "right": "Right"}
+        labels = self._dir_labels
         for val, btn in self._buttons.items():
             btn.delete("all")
             w = btn.winfo_width()

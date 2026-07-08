@@ -5,7 +5,7 @@ from pathlib import Path
 # App version, baked into each build. The updater compares the GitHub release
 # tag against version.txt (written by build.bat), NOT this constant; this one
 # is for the main app to display. Bump both before tagging a release.
-VERSION = "2.3.1"
+VERSION = "3.0.0"
 
 # Paths
 if getattr(sys, "frozen", False):
@@ -118,6 +118,12 @@ SKILL_CATEGORIES = [
 ACTIVE_CATEGORIES      = ["Sprites", "Attack Speed", "Elemental"]
 CUSTOM_PRIORITY_SKILLS = []
 AVOID_SKILLS           = []
+
+# Per-gamemode skill profiles, saved from the GUI's "Save to game mode" button.
+# Shape: {mode_id: {"ACTIVE_CATEGORIES": [...], "CUSTOM_PRIORITY_SKILLS": [...],
+# "AVOID_SKILLS": [...]}}. Applied automatically when the mode selector changes
+# (while stopped) if a profile exists for the newly selected mode.
+MODE_SKILL_PROFILES = {}
 
 # ------------------------------------------------------------------ Template matching
 MATCH_THRESHOLD = 0.78
@@ -296,6 +302,86 @@ REF_GLORY    = REF_DIR / "glory.png"
 REF_ANGEL    = REF_DIR / "angel.png"
 REF_REFRESH  = REF_DIR / "refresh.png"
 
+# ------------------------------------------------------------------ Localized refs
+# The game renders many button labels in the user's game language, so a template
+# captured in English will not match once the game is switched to French or
+# German.  Language variants live in ref/<lang>/ mirroring ref/ by relative
+# filename (ref/fr/refresh.png, ref/fr/all_star/challenge.png, ...); the loader
+# resolves them via ref_path() below.  Skill and boss icons are extracted game
+# assets and stay language-neutral (never variant-captured).
+#
+# Language codes that own a ref override folder: i18n.AVAILABLE_LANGUAGES minus
+# the default, hard-coded so config.py stays free of an i18n import (config is
+# imported very early).  "en" is the default (ref/ itself) so it has no subfolder.
+DEFAULT_REF_LANGUAGE = "en"
+REF_LANG_FOLDERS     = ("fr", "de")
+
+# LOCALIZED_REFS is the AUDITED list of text-bearing templates (rendered words
+# that change with the game language) whose variants the "Recapture refs for
+# language X" wizard walks the user through, in this order.  Paths are relative
+# to REF_DIR (POSIX separators).  Pure iconography (speed toggles, the back
+# arrow, the like thumb, boss/skill icons, number-only Eternal Lode cells) is
+# NOT listed: it needs no per-language capture, though ref_path() still honours a
+# variant file if one happens to exist.  The loader override applies to EVERY
+# ref regardless of this list; the list only drives the wizard's checklist.
+LOCALIZED_REFS = [
+    # Skill-screen banners (the words "Valkyrie" / "Level Up" / "Glory" /
+    # "angel") and the Refresh (reroll) button.
+    "valkyrie.png",
+    "level.png",
+    "glory.png",
+    "angel.png",
+    "refresh.png",
+    # Lobby / chapter / co-op flow buttons.
+    "play_button.png",
+    "devil_reject.png",
+    "continue.png",
+    "get-ready.png",
+    "start_challenge.png",
+    "ad-start.png",
+    "ready-hard-chapter.png",
+    "start-chapter.png",
+    "start-hard-chapter.png",
+    "spin-wheel.png",
+    "wheel-reward.png",
+    # Challenge-ended end screens (the "Challenge has ended" / "Victory" text).
+    "challenge-has-ended.png",
+    "challenge-has-ended2.png",
+    "challenge-has-ended3.png",
+    "challenge-has-ended4.png",
+    # All-Star Cup start button ("Challenge").
+    "all_star/challenge.png",
+    # Eternal Lode "Max" buy toggle.
+    "Eternal Lode/set-max-buy.png",
+]
+
+
+def ref_path(path):
+    """Resolve a ref template to its active-language variant, or the default.
+
+    `path` is a pathlib.Path that lives under REF_DIR (e.g. REF_REFRESH, or
+    ALL_STAR_CHALLENGE, or ETERNAL_LODE_DIR / 'set-max-buy.png').  When LANGUAGE
+    is not "en" and a same-named file exists under REF_DIR/<lang>/ (mirroring the
+    default's path relative to REF_DIR), that variant Path is returned; otherwise
+    the original `path` is returned unchanged.  Custom refs (ref/custom/) are
+    language-agnostic and are never routed through here.
+
+    Missing variants simply fall back to English, so a partially captured
+    language still works (see the language wizard in gui.py)."""
+    if LANGUAGE == DEFAULT_REF_LANGUAGE:
+        return path
+    try:
+        rel = Path(path).resolve().relative_to(REF_DIR.resolve())
+    except (ValueError, OSError):
+        return path
+    # Do not re-route a path that is already inside a language folder, and keep
+    # ref/custom/ untouched (custom captures are language-agnostic).
+    first = rel.parts[0] if rel.parts else ""
+    if first in REF_LANG_FOLDERS or first == "custom":
+        return path
+    cand = REF_DIR / LANGUAGE / rel
+    return cand if cand.exists() else path
+
 # ------------------------------------------------------------------ Capture
 # Capture frames from a continuous Android screenrecord H.264 stream instead of
 # a per-poll `screencap`. The stream keeps the display surface composited (fixes
@@ -308,6 +394,34 @@ AUTOSAVE   = True
 DARK_MODE  = True
 KEEP_AWAKE = False
 HOTKEY     = "ctrl+`"
+
+# GUI/updater display language code (see i18n.AVAILABLE_LANGUAGES). The macro
+# engine's own log messages stay English by design; only the GUI chrome and
+# the updater are translated.
+LANGUAGE = "en"
+
+# ------------------------------------------------------------------ Remote status
+# Optional remote status/control feature, fully OFF by default. The main app
+# NEVER touches the network for this: while enabled, the GUI only writes
+# remote_status.json and reads remote_cmd.json in the install folder; the
+# separate companion exe (remote_agent.py / "A2 Remote.exe") does the outbound
+# HTTPS to the user's own Cloudflare Worker relay. The per-install secret
+# lives in remote_token.txt (created by the GUI on first enable; never
+# shipped, never committed, never logged). See remote/worker/DEPLOY.md and
+# remote/pages/DEPLOY.md for the one-time setup.
+REMOTE_ENABLED = False
+# https URL of the user's own relay worker (the companion refuses non-https).
+REMOTE_RELAY_URL = ""
+# https URL of the static status web page; only used to build pairing links.
+REMOTE_PAGES_URL = ""
+# Seconds between the companion's IDLE status pushes (status pushes are the
+# only Cloudflare KV WRITES, the scarce free-plan resource). The companion
+# polls for commands far more often (cheap reads) and bursts to fast pushes
+# for a short window after a command regardless of this value. 60 keeps a day
+# of remote use well under the free-plan write quota; raise it to stretch
+# further, lower it (min 30) for fresher idle status. See
+# remote/worker/DEPLOY.md, "Usage limits".
+REMOTE_PUSH_INTERVAL = 60
 
 ETERNAL_LODE_MODE = False
 
@@ -604,6 +718,21 @@ def all_star_hp_geometry(w, h):
 # shell in the `input` group) and rooted phones.  Falls back to `adb input tap`
 # automatically whenever the fast path cannot be set up.
 FAST_TAP_ENABLED   = True
+# Extend the sendevent fast-tap path to ALL game modes (chapter / plant / eternal
+# and All-Star), not just All-Star.  Default OFF: when off, chapter / plant /
+# eternal keep tapping via the ordinary `adb input tap`, exactly as before, and
+# All-Star keeps honouring FAST_TAP_ENABLED on its own (unchanged).  When on, the
+# other modes construct a FastTapper too and route taps through it, still falling
+# back to `adb input tap` automatically if the fast path cannot be set up (needs a
+# writable /dev/input node: rooted BlueStacks or a rooted phone).
+ROOT_FAST_INPUT    = False
+# Add human-like variance to every fast tap: gaussian position jitter, a randomised
+# 60-120ms hold, 1-3 px micro-drift move events, and a small pre-tap timing jitter.
+# Default OFF; only meaningful when ROOT_FAST_INPUT (or All-Star fast taps) is on,
+# since humanization lives on the sendevent path (the adb.tap fallback stays a plain
+# tap).  Applies EVERYWHERE fast taps run, All-Star included, which slows All-Star
+# down; turning it off restores raw speed.
+HUMANIZED_TAPS     = False
 # Extra seconds to hold each touch down before releasing.  sendevent's own
 # spacing between the down and up calls already registers a tap on BlueStacks, so
 # 0 is fine; a positive value inserts an on-device `sleep` between down and up for
@@ -628,11 +757,15 @@ PERSISTED_KEYS = (
     "FIRST_SKILL_SLOT", "SECOND_SKILL_SLOT", "GAME_OVER_TAP",
     "SKILL_MATCH_BAND",
     "ACTIVE_CATEGORIES", "CUSTOM_PRIORITY_SKILLS", "AVOID_SKILLS",
+    "MODE_SKILL_PROFILES",
     "USE_STREAM_CAPTURE",
-    "AUTOSAVE", "DARK_MODE", "KEEP_AWAKE", "HOTKEY",
+    "AUTOSAVE", "DARK_MODE", "KEEP_AWAKE", "HOTKEY", "LANGUAGE",
+    "REMOTE_ENABLED", "REMOTE_RELAY_URL", "REMOTE_PAGES_URL",
+    "REMOTE_PUSH_INTERVAL",
     "ETERNAL_LODE_MODE", "GAME_MODE", "EL_FAST_MODE", "ALL_STAR_LEVEL",
     "ALL_STAR_SCAN_ALL_BOSSES", "ALL_STAR_ELIM_BOSSES", "ALL_STAR_ROOT_WARNED",
     "FAST_TAP_ENABLED", "FAST_TAP_HOLD", "FAST_TAP_TRANSFORM",
+    "ROOT_FAST_INPUT", "HUMANIZED_TAPS",
     "ALL_STAR_PAUSE_ON_3RD_DEATH", "ALL_STAR_HP_FULL_FRAC", "ALL_STAR_HP_EMPTY_FRAC",
     "MOVEMENT_MODE", "MOVEMENT_CHAPTER", "MOVEMENT_PLANT_PRESET", "MOVEMENT_PLANT_T",
     "PLANT_SPAWN", "PLANT_ROUNDS",

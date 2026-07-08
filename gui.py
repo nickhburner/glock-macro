@@ -10,8 +10,17 @@ Usage:
 """
 
 import ctypes
+import hashlib
+import json
+import os
 import queue
+import re
+import secrets
+import subprocess
+import sys
 import threading
+import time
+from collections import deque
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
@@ -22,6 +31,8 @@ import all_star
 import capture
 import config
 import eternal_lode
+import i18n
+from i18n import t
 import main
 from adb import ADBClient, ADBError, find_adb, list_devices, choose_server_port
 from matcher import (
@@ -33,6 +44,13 @@ from widgets import (
     RoundedSection, RoundedButton, StatusPill, ToggleSwitch,
     RoundedCheckbox, DirectionPad, SegmentToggle,
 )
+
+# Select the saved language BEFORE any module-level UI string constant below
+# (status colours, game-mode names, settings schema) is built via t().  A
+# language change from the settings dropdown takes full effect on restart;
+# widgets and lookup tables built here stay internally consistent because
+# they are all produced by the same t() calls at import time.
+i18n.set_language(config.LANGUAGE)
 
 # Optional pynput for the global Start/Stop hotkey.
 try:
@@ -88,16 +106,24 @@ _THEMES = {
     },
 }
 
-# Status text -> palette key for its colour.
-_STATUS_COLORS = {"Running": "ok", "Stopped": "bad", "Stopping…": "warn"}
+# Status text -> palette key for its colour.  Resolved at call time (not a
+# module-level dict keyed by translated text) so the mapping always matches
+# what the status set sites wrote, even if set_language changed mid-session.
+def _status_color_key(status_text):
+    return {t("status.running"): "ok", t("status.stopped"): "bad",
+            t("status.stopping"): "warn"}.get(status_text)
 
-# Game modes -- dropdown values and bidirectional lookups.
+
+# Game modes: dropdown values and bidirectional lookups.  Settings persist
+# the mode IDS (left column), never the translated display names, so saved
+# state survives a language switch; the lookup tables and every combobox are
+# built from this one list, keeping text->id mapping consistent.
 _GAME_MODES = [
-    ("chapter", "Chapter"),
-    ("eternal", "Eternal Lode"),
-    ("plant",   "Plant Defense"),
-    ("jungle",  "Shackled Jungle"),
-    ("allstar", "All-Star Cup"),
+    ("chapter", t("game_mode.chapter")),
+    ("eternal", t("game_mode.eternal")),
+    ("plant",   t("game_mode.plant")),
+    ("jungle",  t("game_mode.jungle")),
+    ("allstar", t("game_mode.allstar")),
 ]
 _GM_NAME_TO_ID = {name: gid for gid, name in _GAME_MODES}
 _GM_ID_TO_NAME = {gid: name for gid, name in _GAME_MODES}
@@ -116,66 +142,51 @@ _MAIN_VIEW_KEYS = {"RUN_TIMEOUT_HOURS", "STUCK_TIMEOUT_MINUTES",
 #       "floats3"                  three floats (min / max / step)
 #       "ints2" / "ints4"          N integers
 SETTINGS_SCHEMA = [
-    ("section", "Timing"),
-    ("POLL_INTERVAL", "Poll interval", "float", "seconds",
-     "How long the macro waits between screen checks."),
-    ("ACTION_DELAY", "Action delay", "float", "seconds",
-     "Pause after a tap so the screen can settle before the next check."),
-    ("STARTUP_DELAY", "Startup delay", "float", "seconds",
-     "Grace period after pressing Start before the first screen check. "
-     "With ADB the game window no longer needs to be focused."),
-    ("SKILL_SETTLE_DELAY", "Skill settle delay", "float", "seconds",
-     "After a skill-selection screen is detected, wait this long and re-grab "
-     "before reading the cards, so a fast poll doesn't scan before the cards "
-     "and Refresh button finish animating in. 0.1-0.2s is plenty; 0 disables."),
+    ("section", t("settings.group.timing")),
+    ("POLL_INTERVAL", t("settings.field.poll_interval"), "float",
+     t("settings.unit.seconds"), t("settings.hint.poll_interval")),
+    ("ACTION_DELAY", t("settings.field.action_delay"), "float",
+     t("settings.unit.seconds"), t("settings.hint.action_delay")),
+    ("STARTUP_DELAY", t("settings.field.startup_delay"), "float",
+     t("settings.unit.seconds"), t("settings.hint.startup_delay")),
+    ("SKILL_SETTLE_DELAY", t("settings.field.skill_settle_delay"), "float",
+     t("settings.unit.seconds"), t("settings.hint.skill_settle_delay")),
 
-    ("section", "Run timeout"),
-    ("RUN_TIMEOUT_HOURS", "Run timeout", "float", "hours",
-     "Stop the macro automatically after this long. Set to 0 to disable the "
-     "timeout and run until stopped manually."),
-    ("STUCK_TIMEOUT_MINUTES", "Stuck timeout", "float", "min",
-     "Stop the macro if it keeps repeating the same action (e.g. tapping a "
-     "button that won't dismiss) for this long. Set to 0 to disable."),
-    ("CLOSE_ON_TIMEOUT", "Close game window on timeout", "bool", "",
-     "When the timeout fires, also close the game window, the BlueStacks "
-     "emulator (and its background services) or the scrcpy mirror window."),
-    ("SLEEP_PHONE_ON_TIMEOUT", "Sleep phone on timeout", "bool", "",
-     "When the timeout fires, turn the phone screen off via ADB so the game "
-     "pauses and the phone stops overheating."),
+    ("section", t("timeout.title")),
+    ("RUN_TIMEOUT_HOURS", t("settings.field.run_timeout"), "float",
+     t("timeout.hrs"), t("settings.hint.run_timeout")),
+    ("STUCK_TIMEOUT_MINUTES", t("settings.field.stuck_timeout"), "float",
+     t("timeout.min"), t("settings.hint.stuck_timeout")),
+    ("CLOSE_ON_TIMEOUT", t("timeout.close_on_timeout"), "bool", "",
+     t("settings.hint.close_on_timeout")),
+    ("SLEEP_PHONE_ON_TIMEOUT", t("timeout.sleep_on_timeout"), "bool", "",
+     t("settings.hint.sleep_on_timeout")),
 
-    ("section", "Template matching"),
-    ("MATCH_THRESHOLD", "Skill match threshold", "float", "0-1",
-     "Minimum confidence to accept a skill-icon match. Higher is stricter, "
-     "fewer false matches, but more misses."),
-    ("REF_THRESHOLD", "UI match threshold", "float", "0-1",
-     "Minimum confidence to accept a UI-element match (Play button, devil "
-     "offer, game-over screen, refresh button)."),
-    ("SKILL_DOWNSCALE", "Skill downscale", "float", "factor",
-     "Skill matching runs at this fraction of full resolution for speed. "
-     "1.0 = full res; 0.5 is roughly 4x faster."),
-    ("REF_DOWNSCALE", "Ref downscale", "float", "factor",
-     "UI refs/banners are matched over the whole frame, so they dominate the "
-     "poll time. This runs them at a fraction of resolution. 0.6 is ~2.5x "
-     "faster; 0.5 faster still but riskier for short refs (game-over, level)."),
-    ("CALIBRATED_SCALE", "Calibrated scale", "float", "",
-     "Zoom factor applied to all template scales. 1.0 means the bundled "
-     "templates already match the phone's native resolution. Run Setup "
-     "Wizard to determine the correct value for your device."),
+    ("section", t("settings.group.template_matching")),
+    ("MATCH_THRESHOLD", t("settings.field.skill_threshold"), "float",
+     t("settings.unit.0to1"), t("settings.hint.skill_threshold")),
+    ("REF_THRESHOLD", t("settings.field.ui_threshold"), "float",
+     t("settings.unit.0to1"), t("settings.hint.ui_threshold")),
+    ("SKILL_DOWNSCALE", t("settings.field.skill_downscale"), "float",
+     t("settings.unit.factor"), t("settings.hint.skill_downscale")),
+    ("REF_DOWNSCALE", t("settings.field.ref_downscale"), "float",
+     t("settings.unit.factor"), t("settings.hint.ref_downscale")),
+    ("CALIBRATED_SCALE", t("settings.field.calibrated_scale"), "float", "",
+     t("settings.hint.calibrated_scale")),
 
-    ("section", "Capture"),
-    ("USE_STREAM_CAPTURE", "Stream capture (screenrecord)", "bool", "",
-     "Capture from a continuous Android screenrecord H.264 stream instead of a "
-     "screencap each poll. Keeps the display composited, which fixes BlueStacks "
-     "all-black frames during gameplay, and is faster. Needs PyAV; "
-     "automatically falls back to screencap if it is unavailable."),
+    ("section", t("settings.group.capture")),
+    ("USE_STREAM_CAPTURE", t("settings.field.stream_capture"), "bool", "",
+     t("settings.hint.stream_capture")),
 
-    ("section", "Humanisation"),
-    ("CLICK_JITTER", "Click jitter", "int", "px",
-     "Each tap is nudged by up to this many random pixels so input is not "
-     "pixel-perfect."),
-    ("DELAY_JITTER", "Delay jitter", "float", "fraction",
-     "Poll and action delays vary randomly by +/- this fraction "
-     "(0.35 means +/-35%)."),
+    ("section", t("settings.group.humanisation")),
+    ("CLICK_JITTER", t("settings.field.click_jitter"), "int",
+     t("settings.unit.px"), t("settings.hint.click_jitter")),
+    ("DELAY_JITTER", t("settings.field.delay_jitter"), "float",
+     t("settings.unit.fraction"), t("settings.hint.delay_jitter")),
+    ("ROOT_FAST_INPUT", t("fast_input.root_label"), "bool", "",
+     t("fast_input.root_hint")),
+    ("HUMANIZED_TAPS", t("fast_input.humanized_label"), "bool", "",
+     t("fast_input.humanized_hint")),
 ]
 
 # Entry boxes per non-bool field kind.
@@ -264,8 +275,7 @@ class _AdbCropWindow:
         self._photo = ImageTk.PhotoImage(pil)
 
         win = tk.Toplevel(parent)
-        win.title(self._title
-                  or "Capture  --  drag to select, then click Confirm")
+        win.title(self._title or t("capture.default_title"))
         win.transient(parent)
         win.resizable(False, False)
         self._win = win
@@ -286,12 +296,12 @@ class _AdbCropWindow:
         btn_row.pack(fill="x", padx=8, pady=6)
         self._hint = ttk.Label(
             btn_row,
-            text="Drag to select the button area on the screenshot",
+            text=t("capture.selection_hint"),
             foreground="#888")
         self._hint.pack(side="left")
-        ttk.Button(btn_row, text="Cancel", command=self._cancel).pack(
-            side="right")
-        self._confirm_btn = ttk.Button(btn_row, text="Confirm",
+        ttk.Button(btn_row, text=t("capture.cancel"),
+                   command=self._cancel).pack(side="right")
+        self._confirm_btn = ttk.Button(btn_row, text=t("capture.confirm"),
                                         state="disabled",
                                         command=self._confirm)
         self._confirm_btn.pack(side="right", padx=(0, 6))
@@ -532,12 +542,53 @@ class _HotkeyWatcher:
             self._held.discard(mod)
 
 
+# ------------------------------------------------------------------ Remote IPC
+# The main app never touches the network. While the remote feature is on, the
+# GUI only exchanges these small JSON files (in the install folder) with the
+# separate companion process; the companion does all outbound HTTPS. Paths and
+# protocol must match remote_agent.py.
+_REMOTE_TOKEN_PATH = config.BASE_DIR / "remote_token.txt"
+_REMOTE_STATUS_PATH = config.BASE_DIR / "remote_status.json"
+_REMOTE_CMD_PATH = config.BASE_DIR / "remote_cmd.json"
+_REMOTE_HEARTBEAT_PATH = config.BASE_DIR / "remote_heartbeat.json"
+
+# Commands the GUI will act on (mirrors ALLOWED_COMMANDS in remote_agent.py and
+# worker.js; a second gate here so a tampered remote_cmd.json can do nothing
+# outside this set).
+_REMOTE_ALLOWED_COMMANDS = ("start", "stop", "sleep_phone", "close_emulator")
+
+
+def _remote_read_token():
+    """The per-install secret, or None if it has not been created yet."""
+    try:
+        return _REMOTE_TOKEN_PATH.read_text(encoding="utf-8").strip() or None
+    except OSError:
+        return None
+
+
+def _remote_install_id(token):
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _remote_atomic_write_json(path, obj):
+    """Write JSON via temp file + os.replace so the companion never reads a
+    half-written file."""
+    path = Path(path)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(obj), encoding="utf-8")
+    os.replace(tmp, path)
+
+
 class App:
     def __init__(self, root):
         self.root = root
         self._thread = None
         self._stop_event = None
         self._running = False
+        # Mode the macro is actually running with (frozen at Start), and a
+        # mode change picked while running that has not taken effect yet.
+        self._running_mode = None
+        self._pending_mode = None
         self._drag_cat = None
         self._coords_busy = False
         self._coord_buttons = []  # disabled during ADB capture operations
@@ -555,6 +606,16 @@ class App:
         self._locked = False
         self._locked_geometry = None
         self._log_queue = queue.Queue()
+        # Recent log tail mirrored to the remote status file (see _drain_log).
+        self._recent_log = deque(maxlen=40)
+        # Concise activity summary from main._Activity (remote check-in view).
+        self._activity_lines = []
+        # Remote status/control runtime state (feature OFF unless enabled).
+        self._remote_proc = None            # companion subprocess.Popen
+        self._remote_ipc_after = None       # root.after handle for _remote_tick
+        self._remote_last_status_write = 0.0
+        self._remote_status_label = None    # status line in the settings panel
+        self._remote_token_label = None     # masked-token label
         self.active_rows = {}
         self.vars = {}
         self._thumb_cache = {}
@@ -625,6 +686,10 @@ class App:
         self._apply_theme()
 
         main.set_log_sink(self._log_queue.put)
+        # Concise activity summary (round start/finish, skill-pick tally) for
+        # the remote check-in view. The sink runs on the macro thread; storing
+        # the list by atomic assignment is safe to read from the UI thread.
+        main.set_activity_sink(self._on_activity)
         root.protocol("WM_DELETE_WINDOW", self._on_close)
         root.bind("<Configure>", self._on_configure)
         self.root.after(120, self._drain_log)
@@ -635,6 +700,9 @@ class App:
         # Global hotkey listener (Start/Stop toggle).
         self._hotkey_watcher = None
         self._start_hotkey_watcher()
+
+        # If remote access was left enabled, launch the companion + IPC loop.
+        self._remote_sync_enabled()
 
         # First-run: trigger setup wizard when no device is configured.
         if not config.ADB_DEVICE or not any(config.PHONE_RESOLUTION):
@@ -656,19 +724,19 @@ class App:
         self._topbar_inner = inner
 
         self.start_btn = RoundedButton(
-            inner, text="▶  Start", command=self._start,
+            inner, text="▶  " + t("controls.start"), command=self._start,
             bg=self.theme["ok"], fg="#ffffff",
             font=(ui_font(), 10, "bold"), radius=6,
             canvas_bg=self.theme["surface"])
         self.start_btn.pack(side="left")
 
         self.stop_btn = RoundedButton(
-            inner, text="■  Stop", command=self._stop,
+            inner, text="■  " + t("controls.stop"), command=self._stop,
             bg=self.theme["bad"], fg="#ffffff",
             font=(ui_font(), 10, "bold"), radius=6,
             canvas_bg=self.theme["surface"])
 
-        self.status_var = tk.StringVar(value="Stopped")
+        self.status_var = tk.StringVar(value=t("status.stopped"))
         self._status_pill = StatusPill(
             inner, text_var=self.status_var,
             bg=self.theme["surface_3"],
@@ -687,21 +755,22 @@ class App:
             activebackground=self.theme["surface_2"],
             activeforeground=self.theme["fg"], width=3)
         self._settings_btn.pack(side="right")
-        Tooltip(self._settings_btn, "Settings")
+        Tooltip(self._settings_btn, t("controls.settings_tooltip"))
 
         self._compact_btn = tk.Button(
-            inner, text="Mini", command=self._toggle_compact,
+            inner, text=t("controls.mini"), command=self._toggle_compact,
             font=(ui_font(), 9), relief="flat", cursor="hand2",
             background=self.theme["surface"],
             foreground=self.theme["fg_dim"],
             activebackground=self.theme["surface_2"],
             activeforeground=self.theme["fg"], padx=4, pady=2)
         self._compact_btn.pack(side="right", padx=(0, 2))
-        Tooltip(self._compact_btn, "Compact mini view")
+        Tooltip(self._compact_btn, t("controls.mini_tooltip"))
 
         self.dark_var = tk.BooleanVar(value=self.dark)
         self._theme_btn = tk.Button(
-            inner, text="Dark" if self.dark else "Light",
+            inner,
+            text=t("controls.dark") if self.dark else t("controls.light"),
             command=self._toggle_theme,
             font=(ui_font(), 9), relief="flat", cursor="hand2",
             background=self.theme["surface"],
@@ -709,10 +778,10 @@ class App:
             activebackground=self.theme["surface_2"],
             activeforeground=self.theme["fg"], padx=6, pady=2)
         self._theme_btn.pack(side="right", padx=(0, 2))
-        Tooltip(self._theme_btn, "Toggle dark/light theme")
+        Tooltip(self._theme_btn, t("controls.theme_tooltip"))
 
         self._hotkey_btn = tk.Button(
-            inner, text="Hotkey",
+            inner, text=t("controls.hotkey"),
             command=self._open_hotkey_dialog,
             font=(ui_font(), 9), relief="flat", cursor="hand2",
             background=self.theme["surface"],
@@ -722,35 +791,34 @@ class App:
         self._hotkey_btn.pack(side="right", padx=(0, 8))
         self._hotkey_tip = Tooltip(
             self._hotkey_btn,
-            f"Start / Stop hotkey: {_hotkey_display(config.HOTKEY)}. "
-            f"Click to change.")
+            t("controls.hotkey_tooltip",
+              hotkey=_hotkey_display(config.HOTKEY)))
 
         self.keep_awake_var = tk.BooleanVar(value=config.KEEP_AWAKE)
         self._keep_awake_cb = RoundedCheckbox(
-            inner, text="Keep awake", variable=self.keep_awake_var,
+            inner, text=t("controls.keep_awake"),
+            variable=self.keep_awake_var,
             command=self._on_keep_awake_toggle,
             checked_color=self.theme["accent"],
             unchecked_color=self.theme["surface_3"],
             text_color=self.theme["fg_dim"],
             canvas_bg=self.theme["surface"])
         self._keep_awake_cb.pack(side="right", padx=(0, 8))
-        Tooltip(self._keep_awake_cb,
-                "Prevent the PC from sleeping or dimming the display "
-                "while the macro is open.")
+        Tooltip(self._keep_awake_cb, t("controls.keep_awake_tooltip"))
 
         self.autosave_var = tk.BooleanVar(value=config.AUTOSAVE)
         self._autosave_cb = RoundedCheckbox(
-            inner, text="Autosave", variable=self.autosave_var,
+            inner, text=t("controls.autosave"), variable=self.autosave_var,
             command=self._on_autosave_toggle,
             checked_color=self.theme["accent"],
             unchecked_color=self.theme["surface_3"],
             text_color=self.theme["fg_dim"],
             canvas_bg=self.theme["surface"])
         self._autosave_cb.pack(side="right", padx=(0, 8))
-        Tooltip(self._autosave_cb, "Auto-save settings after every change.")
+        Tooltip(self._autosave_cb, t("controls.autosave_tooltip"))
 
         self._save_btn = tk.Button(
-            inner, text="Save", command=self._save,
+            inner, text=t("controls.save"), command=self._save,
             font=(ui_font(), 9), relief="flat", cursor="hand2",
             background=self.theme["surface"],
             foreground=self.theme["fg_dim"],
@@ -763,7 +831,7 @@ class App:
     # device card (compact ADB selector)
     def _build_device_card(self, parent):
         self._device_section = RoundedSection(
-            parent, title="Device", bg=self.theme["surface"],
+            parent, title=t("device.title"), bg=self.theme["surface"],
             border_color=self.theme["border"],
             title_fg=self.theme["fg"])
         self._device_section.pack(fill="x", padx=8, pady=(6, 3))
@@ -780,7 +848,7 @@ class App:
             foreground=self.theme["fg_muted"], bg=self.theme["surface"])
         self._conn_led.pack(side="left")
         self._conn_label = tk.Label(
-            self._conn_frame, text="Not connected",
+            self._conn_frame, text=t("device.not_connected"),
             font=(ui_font(), 9), foreground=self.theme["fg_muted"],
             bg=self.theme["surface"])
         self._conn_label.pack(side="left", padx=(4, 0))
@@ -799,15 +867,12 @@ class App:
         refresh_btn = ttk.Button(row, text="⟳", width=3,
                                   command=self._refresh_adb_devices)
         refresh_btn.pack(side="left", padx=(6, 0))
-        Tooltip(refresh_btn, "Scan for connected ADB devices.")
+        Tooltip(refresh_btn, t("device.refresh_tooltip"))
 
-        locate_btn = ttk.Button(row, text="adb…", width=5,
+        locate_btn = ttk.Button(row, text=t("device.locate"), width=5,
                                  command=self._locate_adb)
         locate_btn.pack(side="left", padx=(4, 0))
-        Tooltip(locate_btn,
-                "Point the macro at adb yourself. Use this if scanning says "
-                "'adb not found': pick HD-Adb.exe inside your BlueStacks "
-                "folder (or any adb.exe).")
+        Tooltip(locate_btn, t("device.locate_tooltip"))
 
         self.adb_status_label = tk.Label(
             row, text="", font=(ui_font(), 8),
@@ -819,7 +884,7 @@ class App:
     # game mode card with conditional disclosure
     def _build_game_mode_card(self, parent):
         self._gm_section = RoundedSection(
-            parent, title="Game mode", bg=self.theme["surface"],
+            parent, title=t("game_mode.title"), bg=self.theme["surface"],
             border_color=self.theme["border"],
             title_fg=self.theme["fg"])
         self._gm_section.pack(fill="x", padx=8, pady=3)
@@ -830,11 +895,20 @@ class App:
         top.pack(fill="x", pady=(2, 4))
 
         self.game_mode_var = tk.StringVar(
-            value=_GM_ID_TO_NAME.get(config.GAME_MODE, "Chapter"))
+            value=_GM_ID_TO_NAME.get(config.GAME_MODE,
+                                     _GM_ID_TO_NAME["chapter"]))
         combo = ttk.Combobox(top, textvariable=self.game_mode_var,
                              values=_GM_NAMES, state="readonly")
         combo.pack(fill="x")
         combo.bind("<<ComboboxSelected>>", self._on_game_mode_changed)
+
+        # Shown while the macro is running and the user has picked a
+        # different mode than the one it is running with; the new mode is
+        # only applied on Stop (or the next Start), never mid-run.
+        self._gm_pending_label = tk.Label(
+            frame, text=t("game_mode.pending_hint"),
+            foreground=self.theme["warn"], bg=self.theme["surface"],
+            font=(ui_font(), 8, "italic"))
 
         # Area for mode-specific options
         self._gm_disclosure = tk.Frame(frame, bg=self.theme["surface"],
@@ -846,7 +920,7 @@ class App:
                                           bg=self.theme["surface"],
                                           highlightthickness=0)
         self._gm_chapter_sub = RoundedSection(
-            self._gm_chapter_frame, title="MOVEMENT",
+            self._gm_chapter_frame, title=t("game_mode.movement_section"),
             bg=self.theme["surface_2"],
             border_color=self.theme["border"],
             title_fg=self.theme["fg_dim"], radius=6)
@@ -857,7 +931,7 @@ class App:
             self._gm_chapter_sub.inner,
             variable=self._chapter_toggle_bool,
             command=self._on_chapter_toggle,
-            labels=("Don't move", "Timed Chapter"),
+            labels=(t("game_mode.dont_move"), t("game_mode.timed_chapter")),
             left_color=self.theme["accent"],
             right_color=self.theme["accent"],
             container_bg=self.theme["inset"],
@@ -874,7 +948,7 @@ class App:
                                         bg=self.theme["surface"],
                                         highlightthickness=0)
         self._gm_plant_sub = RoundedSection(
-            self._gm_plant_frame, title="PLANT DEFENSE",
+            self._gm_plant_frame, title=t("game_mode.plant_section"),
             bg=self.theme["surface_2"],
             border_color=self.theme["border"],
             title_fg=self.theme["fg_dim"], radius=6)
@@ -892,11 +966,15 @@ class App:
         # Defend direction
         dir_col = tk.Frame(plant_row, bg=self.theme["surface_2"])
         dir_col.pack(side="left", anchor="n")
-        _plant_caption(dir_col, "DEFEND DIRECTION").pack(anchor="w")
+        _plant_caption(dir_col, t("plant.defend_direction")).pack(anchor="w")
         self.plant_dir_var = tk.StringVar(value=config.MOVEMENT_PLANT_PRESET)
         self._plant_dpad = DirectionPad(
             dir_col, variable=self.plant_dir_var,
             command=self._on_plant_dir,
+            labels={"top": t("direction.top"),
+                    "bottom": t("direction.bottom"),
+                    "left": t("direction.left"),
+                    "right": t("direction.right")},
             bg=self.theme["surface_2"],
             selected_color=self.theme["accent"],
             unselected_color=self.theme["surface_3"],
@@ -908,13 +986,13 @@ class App:
         # their side here (constant for a session with the same partner).
         spawn_col = tk.Frame(plant_row, bg=self.theme["surface_2"])
         spawn_col.pack(side="left", anchor="n", padx=(16, 0))
-        _plant_caption(spawn_col, "SPAWN SIDE").pack(anchor="w")
+        _plant_caption(spawn_col, t("plant.spawn_side")).pack(anchor="w")
         self.plant_spawn_bool = tk.BooleanVar(value=config.PLANT_SPAWN == 2)
         self._plant_spawn_toggle = SegmentToggle(
             spawn_col,
             variable=self.plant_spawn_bool,
             command=self._on_plant_spawn,
-            labels=("Left", "Right"),
+            labels=(t("plant.left"), t("plant.right")),
             left_color=self.theme["accent"],
             right_color=self.theme["accent"],
             container_bg=self.theme["inset"],
@@ -922,30 +1000,22 @@ class App:
             outline=self.theme["border"],
             canvas_bg=self.theme["surface_2"])
         self._plant_spawn_toggle.pack(anchor="w", pady=(4, 0))
-        Tooltip(self._plant_spawn_toggle,
-                "Which side YOUR character spawns on. The game decides this "
-                "by the alphabetical order of the two usernames (not by who "
-                "hosts), so it stays the same all session with the same "
-                "partner. If unsure, watch where you spawn in the first "
-                "round and set it here.")
+        Tooltip(self._plant_spawn_toggle, t("plant.spawn_tooltip"))
 
         # Round limit: play this many full rounds of the level, then stop.
         rounds_col = tk.Frame(plant_row, bg=self.theme["surface_2"])
         rounds_col.pack(side="left", anchor="n", padx=(16, 0))
-        _plant_caption(rounds_col, "ROUNDS").pack(anchor="w")
+        _plant_caption(rounds_col, t("plant.rounds")).pack(anchor="w")
         rounds_row = tk.Frame(rounds_col, bg=self.theme["surface_2"])
         rounds_row.pack(anchor="w", pady=(4, 0))
         self.plant_rounds_var = tk.StringVar(value=str(config.PLANT_ROUNDS))
         rounds_entry = ttk.Entry(rounds_row, width=5,
                                  textvariable=self.plant_rounds_var)
         rounds_entry.pack(side="left")
-        tk.Label(rounds_row, text="0 = unlimited",
+        tk.Label(rounds_row, text=t("plant.unlimited_hint"),
                  foreground=self.theme["fg_muted"], bg=self.theme["surface_2"],
                  font=(ui_font(), 9)).pack(side="left", padx=(6, 0))
-        Tooltip(rounds_entry,
-                "Stop the macro after this many completed rounds of the "
-                "level. 0 keeps it running until stopped or the run "
-                "timeout hits.")
+        Tooltip(rounds_entry, t("plant.rounds_tooltip"))
         self.plant_rounds_var.trace_add(
             "write", lambda *_a: self._schedule_autosave())
 
@@ -954,14 +1024,14 @@ class App:
             self._gm_disclosure, bg=self.theme["surface"])
         self._el_fast_var = tk.BooleanVar(value=config.EL_FAST_MODE)
         self._el_fast_cb = ttk.Checkbutton(
-            self._gm_eternal_frame, text="Fast Mode",
+            self._gm_eternal_frame, text=t("eternal.fast_mode"),
             variable=self._el_fast_var,
             command=self._on_el_fast_toggle)
         self._el_fast_cb.pack(anchor="w", pady=(4, 2))
         self._gm_jungle_hint = tk.Label(
             self._gm_disclosure, foreground=self.theme["fg_muted"],
             bg=self.theme["surface"], font=(ui_font(), 9),
-            text="Movement is disabled automatically for Shackled Jungle.")
+            text=t("game_mode.jungle_hint"))
 
         # All-Star Cup: level picker (1-7 or Elim).  Levels scan the 3 boss
         # cards and pick the fastest-dying visible boss; Elim runs 10 levels
@@ -969,7 +1039,7 @@ class App:
         self._gm_allstar_frame = tk.Frame(self._gm_disclosure,
                                            bg=self.theme["surface"],
                                            highlightthickness=0)
-        tk.Label(self._gm_allstar_frame, text="Level",
+        tk.Label(self._gm_allstar_frame, text=t("game_mode.allstar_level_label"),
                  foreground=self.theme["fg_dim"], bg=self.theme["surface"],
                  font=(ui_font(), 9)).pack(anchor="w", pady=(4, 0))
         self.allstar_level_var = tk.StringVar(
@@ -989,7 +1059,7 @@ class App:
             self._gm_elim_frame, foreground=self.theme["fg_dim"],
             bg=self.theme["surface"], font=(ui_font(), 9))
         self._elim_summary.pack(anchor="w", pady=(2, 0))
-        ttk.Button(self._gm_elim_frame, text="Choose bosses…",
+        ttk.Button(self._gm_elim_frame, text=t("game_mode.elim_choose_bosses"),
                    command=self._open_elim_picker).pack(
                        anchor="w", pady=(2, 2))
 
@@ -1014,20 +1084,42 @@ class App:
 
     def _on_game_mode_changed(self, _event=None):
         self._update_game_mode_disclosure()
-        self._schedule_autosave()
         gm = self._game_mode_id()
-        main.log(f"game mode: {_GM_ID_TO_NAME.get(gm, gm)}")
+
+        if self._running:
+            # The running macro must never see a mid-run mode switch: keep
+            # the pick as "pending" until Stop (or the next Start) applies
+            # it. Picking back the mode that is actually running clears it.
+            if gm == self._running_mode:
+                self._pending_mode = None
+            else:
+                self._pending_mode = gm
+            self._update_pending_mode_hint()
+        else:
+            # Not running: the new mode (and its saved skill profile, if
+            # any) takes effect immediately.
+            self._apply_mode_skill_profile(gm)
+
+        self._schedule_autosave()
+        main.log(t("log.game_mode", name=_GM_ID_TO_NAME.get(gm, gm))
+                 + (" " + t("log.applies_next_start")
+                    if self._pending_mode else ""))
         # One-time heads-up: All-Star mode depends on fast input via a
         # writable /dev/input node, which only a rooted BlueStacks instance
         # provides.  Shown once, then remembered in settings.
         if gm == "allstar" and not config.ALL_STAR_ROOT_WARNED:
             config.ALL_STAR_ROOT_WARNED = True
             messagebox.showwarning(
-                "All-Star Cup",
-                "All-Star Cup mode ONLY works on a rooted BlueStacks "
-                "instance.\n\nIt will not work on a regular phone or an "
-                "unrooted emulator. (This warning is shown once.)",
+                t("game_mode.allstar_root_title"),
+                t("game_mode.allstar_root_body"),
                 parent=self.root)
+
+    def _update_pending_mode_hint(self):
+        """Show/hide the amber "applies on next Start" label."""
+        if self._pending_mode is not None:
+            self._gm_pending_label.pack(anchor="w", pady=(0, 2))
+        else:
+            self._gm_pending_label.pack_forget()
 
     def _update_game_mode_disclosure(self):
         """Show/hide the mode-specific sub-options."""
@@ -1092,22 +1184,19 @@ class App:
             self._render_elim_summary()
             self._gm_elim_frame.pack(fill="x", before=self._gm_allstar_hint)
             self._gm_allstar_hint.configure(
-                text="Position the game on the Elim entry screen, then "
-                     "Start. The macro picks your chosen boss at each of "
-                     f"the {config.ALL_STAR_ELIM_SETS} levels.")
+                text=t("game_mode.elim_hint",
+                       sets=config.ALL_STAR_ELIM_SETS))
         else:
             self._gm_elim_frame.pack_forget()
-            self._gm_allstar_hint.configure(
-                text="Position the game on the level's Challenge screen, "
-                     "then Start. The macro identifies the 3 bosses each "
-                     "set and picks the fastest-dying one, then stops.")
+            self._gm_allstar_hint.configure(text=t("game_mode.allstar_hint"))
 
     def _render_elim_summary(self):
         chosen = sum(1 for b in self.elim_bosses if b)
         self._elim_summary.configure(
-            text=f"Bosses chosen: {chosen}/{len(self.elim_bosses)}"
+            text=t("game_mode.elim_bosses_chosen", chosen=chosen,
+                   total=len(self.elim_bosses))
                  + ("" if chosen == len(self.elim_bosses)
-                    else "  (unset = best visible)"))
+                    else t("game_mode.elim_unset_hint")))
 
     # ------------------------------------------------------------------ Elim boss picker
 
@@ -1145,7 +1234,7 @@ class App:
         p = self.theme
         win = tk.Toplevel(self.root)
         self._elim_picker = win
-        win.title("Elim boss picks")
+        win.title(t("elim.window_title"))
         win.geometry("900x680")
         win.transient(self.root)
         win.configure(background=p["bg"])
@@ -1153,11 +1242,10 @@ class App:
 
         head = tk.Frame(win, bg=p["bg"], highlightthickness=0)
         head.pack(fill="x", padx=12, pady=(10, 2))
-        tk.Label(head, text="Elim boss picks", font=(ui_font(), 12, "bold"),
+        tk.Label(head, text=t("elim.heading"), font=(ui_font(), 12, "bold"),
                  fg=p["fg"], bg=p["bg"]).pack(side="left")
         tk.Label(head,
-                 text="Click a boss to assign it to the highlighted level. "
-                      "Click a level to select it; right-click clears it.",
+                 text=t("elim.instructions"),
                  fg=p["fg_muted"], bg=p["bg"],
                  font=(ui_font(), 9)).pack(side="left", padx=(14, 0))
 
@@ -1180,11 +1268,11 @@ class App:
         self._elim_counts = tk.Label(footer, text="", fg=p["fg_muted"],
                                      bg=p["bg"], font=(ui_font(), 9))
         self._elim_counts.pack(side="left")
-        RoundedButton(footer, text="Done", command=win.destroy,
+        RoundedButton(footer, text=t("elim.done"), command=win.destroy,
                       bg=p["accent"], fg="#ffffff",
                       font=(ui_font(), 9, "bold"), radius=6,
                       canvas_bg=p["bg"]).pack(side="right")
-        ttk.Button(footer, text="Clear all",
+        ttk.Button(footer, text=t("elim.clear_all"),
                    command=self._elim_clear_all).pack(
                        side="right", padx=(0, 8))
 
@@ -1244,7 +1332,7 @@ class App:
                                  text="?" if name else "+",
                                  fill=p["fg_muted"], font=(ui_font(), 16))
             cell.pack()
-            lbl = tk.Label(unit, text=f"L{i + 1}",
+            lbl = tk.Label(unit, text=t("elim.level_label", n=i + 1),
                            fg=p["accent"] if sel else p["fg_dim"],
                            bg=p["bg"],
                            font=(ui_font(), 8, "bold" if sel else "normal"))
@@ -1286,8 +1374,8 @@ class App:
             return
         try:
             chosen = sum(1 for b in self.elim_bosses if b)
-            lbl.configure(text=f"● {chosen}/{len(self.elim_bosses)} levels "
-                               "assigned")
+            lbl.configure(text=t("elim.assigned_footer", chosen=chosen,
+                                 total=len(self.elim_bosses)))
         except tk.TclError:
             pass
 
@@ -1340,7 +1428,7 @@ class App:
     # timeout card (stays on main view)
     def _build_timeout_card(self, parent):
         self._timeout_section = RoundedSection(
-            parent, title="Run timeout",
+            parent, title=t("timeout.title"),
             bg=self.theme["surface"],
             border_color=self.theme["border"],
             title_fg=self.theme["fg"])
@@ -1350,52 +1438,48 @@ class App:
         row = tk.Frame(frame, bg=self.theme["surface"],
                        highlightthickness=0)
         row.pack(fill="x", pady=(2, 4))
-        tk.Label(row, text="Stop after", bg=self.theme["surface"],
+        tk.Label(row, text=t("timeout.stop_after"), bg=self.theme["surface"],
                  fg=self.theme["fg_dim"],
                  font=(ui_font(), 9)).pack(side="left")
         ttk.Entry(row, textvariable=self.vars["RUN_TIMEOUT_HOURS"][0],
                   width=6).pack(side="left", padx=(6, 4))
-        tk.Label(row, text="hrs", bg=self.theme["surface"],
+        tk.Label(row, text=t("timeout.hrs"), bg=self.theme["surface"],
                  fg=self.theme["fg_muted"],
                  font=(ui_font(), 9)).pack(side="left")
-        Tooltip(row, "Stop the macro automatically after this long. "
-                     "Set to 0 to disable.")
+        Tooltip(row, t("timeout.stop_after_tooltip"))
 
         row_stuck = tk.Frame(frame, bg=self.theme["surface"],
                              highlightthickness=0)
         row_stuck.pack(fill="x", pady=(2, 4))
-        tk.Label(row_stuck, text="Stuck after", bg=self.theme["surface"],
-                 fg=self.theme["fg_dim"],
+        tk.Label(row_stuck, text=t("timeout.stuck_after"),
+                 bg=self.theme["surface"], fg=self.theme["fg_dim"],
                  font=(ui_font(), 9)).pack(side="left")
         ttk.Entry(row_stuck, textvariable=self.vars["STUCK_TIMEOUT_MINUTES"][0],
                   width=6).pack(side="left", padx=(6, 4))
-        tk.Label(row_stuck, text="min", bg=self.theme["surface"],
+        tk.Label(row_stuck, text=t("timeout.min"), bg=self.theme["surface"],
                  fg=self.theme["fg_muted"],
                  font=(ui_font(), 9)).pack(side="left")
-        Tooltip(row_stuck, "Stop the macro if it keeps repeating the same "
-                           "action for this long. Set to 0 to disable.")
+        Tooltip(row_stuck, t("timeout.stuck_after_tooltip"))
 
         self._timeout_cb1 = RoundedCheckbox(
-            frame, text="Close game window on timeout",
+            frame, text=t("timeout.close_on_timeout"),
             variable=self.vars["CLOSE_ON_TIMEOUT"],
             checked_color=self.theme["accent"],
             unchecked_color=self.theme["surface_3"],
             text_color=self.theme["fg_dim"],
             canvas_bg=self.theme["surface"])
         self._timeout_cb1.pack(anchor="w", pady=2)
-        Tooltip(self._timeout_cb1,
-                "Close the emulator/scrcpy window when the timeout fires.")
+        Tooltip(self._timeout_cb1, t("timeout.close_on_timeout_tooltip"))
 
         self._timeout_cb2 = RoundedCheckbox(
-            frame, text="Sleep phone on timeout",
+            frame, text=t("timeout.sleep_on_timeout"),
             variable=self.vars["SLEEP_PHONE_ON_TIMEOUT"],
             checked_color=self.theme["accent"],
             unchecked_color=self.theme["surface_3"],
             text_color=self.theme["fg_dim"],
             canvas_bg=self.theme["surface"])
         self._timeout_cb2.pack(anchor="w", pady=(2, 4))
-        Tooltip(self._timeout_cb2,
-                "Turn the phone screen off via ADB when the timeout fires.")
+        Tooltip(self._timeout_cb2, t("timeout.sleep_on_timeout_tooltip"))
 
     def _locate_adb(self):
         """Let the user browse to an adb binary by hand (the rescue path when
@@ -1403,18 +1487,17 @@ class App:
         settings.json immediately, then rescans for devices."""
         path = filedialog.askopenfilename(
             parent=self.root,
-            title="Pick adb.exe or HD-Adb.exe",
+            title=t("device.locate_dialog_title"),
             initialdir=r"C:\Program Files",
-            filetypes=[("adb executable", "adb.exe HD-Adb.exe"),
-                       ("Programs", "*.exe")])
+            filetypes=[(t("device.locate_filter_name"), "adb.exe HD-Adb.exe"),
+                       (t("device.locate_filter_programs"), "*.exe")])
         if not path:
             return
         name = Path(path).name.lower()
         if "adb" not in name:
             messagebox.showwarning(
-                "Locate adb",
-                f"{Path(path).name} does not look like adb.\n\n"
-                "Pick HD-Adb.exe (inside your BlueStacks folder) or adb.exe.",
+                t("device.locate_not_adb_title"),
+                t("device.locate_not_adb_body", name=Path(path).name),
                 parent=self.root)
             return
         config.ADB_PATH = path
@@ -1433,12 +1516,23 @@ class App:
             choose_server_port(adb_exe)
             devices = list_devices(adb_exe)
         except Exception as e:
-            self._update_adb_status(f"adb not found: {e}", ok=False)
+            self._update_adb_status(t("device.adb_not_found", error=e),
+                                    ok=False)
             try:
                 self.adb_combo["values"] = []
             except tk.TclError:
                 pass
             return
+
+        # The same BlueStacks instance shows up twice: as emulator-N and as
+        # 127.0.0.1:5555. Hide the emulator-N alias when a TCP entry is ready
+        # so the dropdown is not cluttered with duplicates.
+        has_ready_localhost = any(
+            d["state"] == "device" and re.match(r"(127\.0\.0\.1|localhost):\d+", d["serial"])
+            for d in devices
+        )
+        if has_ready_localhost:
+            devices = [d for d in devices if not re.match(r"emulator-\d+", d["serial"])]
 
         for d in devices:
             self._adb_label_to_serial[d["label"]] = d["serial"]
@@ -1479,7 +1573,8 @@ class App:
 
         count = len(devices)
         self._update_adb_status(
-            f"{count} device(s) found" if count else "No devices found",
+            t("device.devices_found", count=count) if count
+            else t("device.no_devices_found"),
             ok=count > 0)
         # Warm the stream now so the first Test Connection / ref capture is
         # instant instead of paying the screenrecord cold start.
@@ -1498,13 +1593,13 @@ class App:
         if hasattr(self, "_conn_led") and hasattr(self, "_conn_label"):
             if ok is True:
                 conn_color = self.theme["ok"]
-                conn_text = "Connected"
+                conn_text = t("device.connected")
             elif ok is False:
                 conn_color = self.theme["bad"]
-                conn_text = "Disconnected"
+                conn_text = t("device.disconnected")
             else:
                 conn_color = self.theme["fg_muted"]
-                conn_text = "Not connected"
+                conn_text = t("device.not_connected")
             try:
                 self._conn_led.configure(foreground=conn_color)
                 self._conn_label.configure(foreground=conn_color,
@@ -1517,7 +1612,7 @@ class App:
         label = self.adb_device_var.get()
         serial = self._adb_label_to_serial.get(label, label)
         config.ADB_DEVICE = serial
-        self._update_adb_status(f"Selected: {serial}", ok=None)
+        self._update_adb_status(t("device.selected", serial=serial), ok=None)
         self._schedule_autosave()
         self._prewarm_capture_stream()
 
@@ -1653,7 +1748,7 @@ class App:
             return
         self._coords_busy = True
         self._set_coord_buttons("disabled")
-        self._update_adb_status("Capturing screenshot…", ok=None)
+        self._update_adb_status(t("device.capturing_screenshot"), ok=None)
 
         def worker():
             screenshot = None
@@ -1662,10 +1757,12 @@ class App:
                 h, w = screenshot.shape[:2]
                 device = config.ADB_DEVICE or "device"
                 main.log(f"ADB test: {w}x{h} screenshot from {device}")
-                self._update_adb_status(f"Connected: {device}", ok=True)
+                self._update_adb_status(
+                    t("device.connected_status", device=device), ok=True)
             except Exception as e:
                 main.log(f"ADB test failed: {e}")
-                self._update_adb_status(f"Test failed: {e}", ok=False)
+                self._update_adb_status(
+                    t("device.test_failed", error=e), ok=False)
 
             def done():
                 self._coords_busy = False
@@ -1692,7 +1789,7 @@ class App:
         photo = ImageTk.PhotoImage(pil)
 
         win = tk.Toplevel(self.root)
-        win.title(f"ADB Screenshot  ({w_px} x {h_px})")
+        win.title(t("capture.screenshot_title", w=w_px, h=h_px))
         win.transient(self.root)
         win.resizable(False, False)
 
@@ -1702,33 +1799,31 @@ class App:
         canvas.create_image(0, 0, anchor="nw", image=photo)
         canvas._photo_ref = photo   # prevent GC
 
-        ttk.Button(win, text="Close", command=win.destroy).pack(pady=6)
+        ttk.Button(win, text=t("capture.close"),
+                   command=win.destroy).pack(pady=6)
 
     def _run_setup_wizard(self):
         """First-time ADB setup dialog."""
         win = tk.Toplevel(self.root)
-        win.title("ADB Setup Wizard")
+        win.title(t("wizard.title"))
         win.geometry("500x420")
         win.transient(self.root)
         win.grab_set()
         win.configure(background=self.theme["bg"])
         win.resizable(False, False)
 
-        ttk.Label(win, text="ADB Setup Wizard",
+        ttk.Label(win, text=t("wizard.heading"),
                   font=("", 12, "bold")).pack(fill="x", padx=16, pady=(16, 4))
         ttk.Label(
             win, wraplength=466, justify="left",
-            text="Connects an Android device or emulator via ADB, queries "
-                 "its screen resolution, and sets sensible click-target "
-                 "defaults. Run this once when first setting up or when "
-                 "changing devices."
+            text=t("wizard.intro")
         ).pack(fill="x", padx=16, pady=(0, 8))
         ttk.Separator(win).pack(fill="x", padx=16, pady=4)
 
         # Device selector row
         dev_frame = ttk.Frame(win)
         dev_frame.pack(fill="x", padx=16, pady=6)
-        ttk.Label(dev_frame, text="Device:").pack(side="left")
+        ttk.Label(dev_frame, text=t("wizard.device_label")).pack(side="left")
         dev_var = tk.StringVar()
         combo = ttk.Combobox(dev_frame, textvariable=dev_var, width=34)
         combo.pack(side="left", padx=(6, 0))
@@ -1749,12 +1844,12 @@ class App:
                 if len(devs) == 1:
                     dev_var.set(list(label_to_serial)[0])
             except Exception as e:
-                messagebox.showerror("Refresh",
-                                     f"Could not list devices:\n{e}",
+                messagebox.showerror(t("wizard.refresh_failed_title"),
+                                     t("wizard.refresh_failed_body", error=e),
                                      parent=win)
 
         do_refresh_wiz()
-        ttk.Button(dev_frame, text="Refresh", width=8,
+        ttk.Button(dev_frame, text=t("wizard.refresh"), width=8,
                    command=do_refresh_wiz).pack(side="left", padx=(6, 0))
 
         ttk.Separator(win).pack(fill="x", padx=16, pady=4)
@@ -1775,11 +1870,12 @@ class App:
             serial = label_to_serial.get(lbl, lbl)
             if not serial:
                 messagebox.showerror(
-                    "Connect", "Select a device first.", parent=win)
+                    t("wizard.connect_failed_title"),
+                    t("wizard.select_device_first"), parent=win)
                 return
             connect_btn.config(state="disabled")
             finish_btn.config(state="disabled")
-            status_var.set("Connecting…")
+            status_var.set(t("wizard.connecting"))
             res_var.set("")
             win.update_idletasks()
 
@@ -1792,17 +1888,15 @@ class App:
                     _result.update(ok=True, w=w, h=h, serial=serial)
 
                     def done():
-                        status_var.set("Connected successfully.")
-                        res_var.set(
-                            f"Resolution: {w} x {h}  |  "
-                            f"CALIBRATED_SCALE: {config.CALIBRATED_SCALE} "
-                            f"(current, adjust in Settings if needed)")
+                        status_var.set(t("wizard.connected_successfully"))
+                        res_var.set(t("wizard.resolution_summary", w=w, h=h,
+                                      scale=config.CALIBRATED_SCALE))
                         finish_btn.config(state="normal")
                         connect_btn.config(state="normal")
                 except Exception as e:
                     err = str(e)   # bind now; `e` is cleared after the except
                     def done():  # noqa: F811
-                        status_var.set(f"Connection failed: {err}")
+                        status_var.set(t("wizard.connection_failed", error=err))
                         connect_btn.config(state="normal")
                 try:
                     win.after(0, done)
@@ -1814,15 +1908,15 @@ class App:
         connect_frame = ttk.Frame(win)
         connect_frame.pack(fill="x", padx=16, pady=6)
         connect_btn = ttk.Button(
-            connect_frame, text="Connect & Detect Resolution",
+            connect_frame, text=t("wizard.connect_and_detect"),
             command=do_connect)
         connect_btn.pack(side="left")
 
         btn_frame = ttk.Frame(win)
         btn_frame.pack(side="bottom", fill="x", padx=16, pady=12)
-        ttk.Button(btn_frame, text="Cancel",
+        ttk.Button(btn_frame, text=t("wizard.cancel"),
                    command=win.destroy).pack(side="right")
-        finish_btn = ttk.Button(btn_frame, text="Apply & Close",
+        finish_btn = ttk.Button(btn_frame, text=t("wizard.apply_and_close"),
                                  state="disabled")
         finish_btn.pack(side="right", padx=(0, 6))
 
@@ -1873,6 +1967,14 @@ class App:
         self.movement_plant_t_var = tk.StringVar(
             value=str(config.MOVEMENT_PLANT_T))
         self.movement_plant_spawn_var = tk.IntVar(value=1)
+        # Remote status/control settings (not part of SETTINGS_SCHEMA: the
+        # enable toggle has side effects, so it is wired to a command instead
+        # of the generic autosave-only path).
+        self.remote_enabled_var = tk.BooleanVar(value=bool(config.REMOTE_ENABLED))
+        self.remote_relay_var = tk.StringVar(value=config.REMOTE_RELAY_URL)
+        self.remote_pages_var = tk.StringVar(value=config.REMOTE_PAGES_URL)
+        # GUI display language (persisted; full relabel happens on restart).
+        self.language_var = tk.StringVar(value=self._language_name(config.LANGUAGE))
 
     # theme
     def _apply_theme(self):
@@ -2018,7 +2120,7 @@ class App:
                 pass
 
     def _update_status_color(self):
-        key = _STATUS_COLORS.get(self.status_var.get())
+        key = _status_color_key(self.status_var.get())
         color = self.theme[key] if key else self.theme["fg"]
         if getattr(self, "_status_pill", None) is not None:
             self._status_pill.set_colors(
@@ -2036,7 +2138,8 @@ class App:
         self.dark_var.set(self.dark)
         self.theme = _THEMES["dark" if self.dark else "light"]
         if hasattr(self, "_theme_btn"):
-            self._theme_btn.configure(text="Dark" if self.dark else "Light")
+            self._theme_btn.configure(
+                text=t("controls.dark") if self.dark else t("controls.light"))
         set_dark_titlebar(self.root, self.dark)
         self._apply_theme()
         # _apply_theme re-styles ttk widgets and the custom canvas widgets, but
@@ -2045,7 +2148,8 @@ class App:
         # mode" bug). Remap the whole tree so a live switch looks identical to
         # launching fresh in that mode.
         self._remap_tree_colors(old, self.theme)
-        main.log("dark mode on" if self.dark else "dark mode off")
+        main.log(t("log.dark_mode_on") if self.dark
+                 else t("log.dark_mode_off"))
         self._apply_and_save(quiet=True)
 
     # Palette roles split by where each colour is used: background-ish options
@@ -2150,12 +2254,25 @@ class App:
     # skill categories
     def _build_skills(self, parent):
         self._skills_section = RoundedSection(
-            parent, title="Skill categories",
+            parent, title=t("skills.section_title"),
             bg=self.theme["surface"],
             border_color=self.theme["border"],
             title_fg=self.theme["fg"])
         self._skills_section.pack(fill="x", padx=8, pady=6)
         skills = self._skills_section.inner
+
+        header = tk.Frame(skills, bg=self.theme["surface"],
+                          highlightthickness=0)
+        header.pack(fill="x", pady=(0, 4))
+        self._save_profile_btn = ttk.Button(
+            header, text=t("game_mode.save_profile"),
+            command=self._save_mode_skill_profile)
+        self._save_profile_btn.pack(side="left")
+        Tooltip(self._save_profile_btn, t("game_mode.save_profile_tooltip"))
+        self._save_profile_status = tk.Label(
+            header, text="", foreground=self.theme["ok"],
+            bg=self.theme["surface"], font=(ui_font(), 8, "italic"))
+        self._save_profile_status.pack(side="left", padx=(8, 0))
 
         cols = tk.Frame(skills, bg=self.theme["surface"],
                         highlightthickness=0)
@@ -2165,7 +2282,7 @@ class App:
         cols.rowconfigure(0, weight=1)
 
         self._inactive_section = RoundedSection(
-            cols, title="Inactive  -  Tick to Activate",
+            cols, title=t("skills.inactive_title"),
             bg=self.theme["surface_2"],
             border_color=self.theme["border"],
             title_fg=self.theme["fg_muted"], radius=6)
@@ -2173,7 +2290,7 @@ class App:
                                     padx=(0, 4))
 
         self._active_section = RoundedSection(
-            cols, title="Active  -  Drag to Rank",
+            cols, title=t("skills.active_title"),
             bg=self.theme["surface_2"],
             border_color=self.theme["border"],
             title_fg=self.theme["fg_muted"], radius=6)
@@ -2192,6 +2309,45 @@ class App:
     def _skill_count(self, category):
         return len(list_skill_files(config.SKILLS_DIR / category))
 
+    # per-gamemode skill profiles
+    def _save_mode_skill_profile(self):
+        """Snapshot the active categories / custom priority / avoid lists
+        currently shown in the GUI into MODE_SKILL_PROFILES under the
+        selected game mode, and persist it."""
+        gm = self._game_mode_id()
+        profiles = dict(config.MODE_SKILL_PROFILES)
+        profiles[gm] = {
+            "ACTIVE_CATEGORIES": list(self.active),
+            "CUSTOM_PRIORITY_SKILLS": list(self.custom),
+            "AVOID_SKILLS": list(self.avoid),
+        }
+        config.MODE_SKILL_PROFILES = profiles
+        config.save_settings()
+        name = _GM_ID_TO_NAME.get(gm, gm)
+        main.log(t("log.profile_saved", name=name))
+        self._save_profile_status.configure(
+            text=t("game_mode.saved_for", name=name))
+        self.root.after(2500, lambda: self._save_profile_status.configure(text=""))
+
+    def _apply_mode_skill_profile(self, gm):
+        """If a saved profile exists for game mode *gm*, load its three
+        lists into the GUI panels (and thus into config on the next save).
+        No-op if nothing was ever saved for that mode. Must only be called
+        while the macro is NOT running (or once a pending mode switch is
+        actually being applied), so a saved profile never overwrites the
+        lists the running macro is using mid-run."""
+        profile = config.MODE_SKILL_PROFILES.get(gm)
+        if not profile:
+            return
+        self.active = [c for c in profile.get("ACTIVE_CATEGORIES", [])
+                       if c in config.SKILL_CATEGORIES]
+        self.custom = list(profile.get("CUSTOM_PRIORITY_SKILLS", []))
+        self.avoid = list(profile.get("AVOID_SKILLS", []))
+        self._render_skills()
+        self._render_custom()
+        self._render_avoid()
+        main.log(t("log.profile_loaded", name=_GM_ID_TO_NAME.get(gm, gm)))
+
     def _render_skills(self):
         for frame in (self.inactive_frame, self.active_frame):
             for child in frame.winfo_children():
@@ -2202,7 +2358,7 @@ class App:
         inactive = [c for c in config.SKILL_CATEGORIES if c not in self.active]
 
         if not inactive:
-            tk.Label(self.inactive_frame, text="(none)",
+            tk.Label(self.inactive_frame, text=t("skills.none"),
                      foreground=p["fg_muted"], bg=p["surface_2"],
                      font=(ui_font(), 9)).pack(anchor="w")
         for cat in inactive:
@@ -2224,7 +2380,7 @@ class App:
                      font=(ui_font(), 8)).pack(side="right")
 
         if not self.active:
-            tk.Label(self.active_frame, text="(none)",
+            tk.Label(self.active_frame, text=t("skills.none"),
                      foreground=p["fg_muted"], bg=p["surface_2"],
                      font=(ui_font(), 9)).pack(anchor="w")
         for i, cat in enumerate(self.active, 1):
@@ -2360,14 +2516,14 @@ class App:
     # custom priority / avoid skills
     def _build_custom(self, parent):
         self._custom_section = RoundedSection(
-            parent, title="Custom priority skills",
+            parent, title=t("custom_priority.section_title"),
             bg=self.theme["surface"],
             border_color=self.theme["border"],
             title_fg=self.theme["fg"])
         self._custom_section.pack(fill="x", padx=8, pady=6)
 
         tk.Label(self._custom_section.inner,
-                 text="taken above all categories",
+                 text=t("custom_priority.hint"),
                  foreground=self.theme["fg_muted"],
                  bg=self.theme["surface"],
                  font=(ui_font(), 8)).pack(anchor="w", pady=(0, 2))
@@ -2379,14 +2535,14 @@ class App:
 
     def _build_avoid(self, parent):
         self._avoid_section = RoundedSection(
-            parent, title="Avoid skills",
+            parent, title=t("avoid.section_title"),
             bg=self.theme["surface"],
             border_color=self.theme["border"],
             title_fg=self.theme["fg"])
         self._avoid_section.pack(fill="x", padx=8, pady=6)
 
         tk.Label(self._avoid_section.inner,
-                 text="never taken",
+                 text=t("avoid.hint"),
                  foreground=self.theme["fg_muted"],
                  bg=self.theme["surface"],
                  font=(ui_font(), 8)).pack(anchor="w", pady=(0, 2))
@@ -2454,9 +2610,9 @@ class App:
                     self._skill_hash(ident)      # hash is size-independent
                 done += 1
                 if progress is not None and (done % 8 == 0 or done == total):
-                    progress(done, total, "Loading skill icons…")
+                    progress(done, total, t("splash.loading_skill_icons"))
         if progress is not None:
-            progress(total, total, "Ready")
+            progress(total, total, t("splash.ready"))
 
     def _draw_skill_cell(self, cell, identifier, size, highlight=None):
         """(Re)draw a skill cell's rounded border + thumbnail. Split out from
@@ -2531,11 +2687,11 @@ class App:
     def _render_custom(self):
         self._render_skill_strip(self.custom_frame, self.custom, _CUSTOM_COLOR,
                                  self._toggle_custom,
-                                 "(no custom priority skills)")
+                                 t("custom_priority.empty"))
 
     def _render_avoid(self):
         self._render_skill_strip(self.avoid_frame, self.avoid, _AVOID_COLOR,
-                                 self._toggle_avoid, "(no skills avoided)")
+                                 self._toggle_avoid, t("avoid.empty"))
 
     def _toggle_in(self, items, identifier):
         h = self._skill_hash(identifier)
@@ -2611,7 +2767,8 @@ class App:
             self._custom_thumb_refs.append(photo)
             thumb = tk.Label(inner, image=photo, background="white")
         else:
-            thumb = tk.Label(inner, text="(bad image)", width=12, height=3,
+            thumb = tk.Label(inner, text=t("custom_button.bad_image"),
+                             width=12, height=3,
                              background="white", foreground="#999")
         thumb.pack()
         caption = tk.Label(inner, text=path.stem, background="white",
@@ -2621,20 +2778,21 @@ class App:
             widget.configure(cursor="hand2")
             widget.bind("<Button-1>",
                         lambda e, p=path: self._remove_custom_button(p))
-        Tooltip(cell, f"{path.name} , click to remove")
+        Tooltip(cell, t("custom_button.remove_tooltip", name=path.name))
         return cell
 
     def _remove_custom_button(self, path):
         if not messagebox.askyesno(
-                "Remove custom button",
-                f"Remove the custom button '{path.stem}'?"):
+                t("custom_button.remove_title"),
+                t("custom_button.remove_confirm", name=path.stem)):
             return
         try:
             path.unlink()
             main.log(f"removed custom button '{path.stem}'")
         except OSError as e:
-            messagebox.showerror("Remove custom button",
-                                 f"Could not delete the file:\n{e}")
+            messagebox.showerror(
+                t("custom_button.remove_title"),
+                t("custom_button.remove_failed_body", error=e))
         self._render_custom_buttons()
 
     def _capture_crop_to(self, path, title, after_save=None, zone=None):
@@ -2744,12 +2902,12 @@ class App:
         """A 'Search zone:' combobox row; returns its StringVar."""
         zrow = ttk.Frame(parent)
         zrow.pack(fill="x", padx=14, pady=4)
-        ttk.Label(zrow, text="Search zone:").pack(side="left")
+        ttk.Label(zrow, text=t("ref.search_zone_label")).pack(side="left")
         zvar = tk.StringVar(value=initial)
         ttk.Combobox(zrow, textvariable=zvar, values=list(config.ZONE_CHOICES),
                      state="readonly", width=10).pack(side="left", padx=(6, 0))
         ttk.Label(zrow, foreground="#888",
-                  text="top / middle / bottom 50% (faster matching)").pack(
+                  text=t("ref.search_zone_hint")).pack(
             side="left", padx=8)
         return zvar
 
@@ -2758,24 +2916,23 @@ class App:
         if self._coords_busy:
             return
         if self._running:
-            main.log("stop the macro before adding a custom button")
+            main.log(t("capture.stop_macro_before_button"))
             return
 
         win = tk.Toplevel(self.root)
-        win.title("Add custom button")
+        win.title(t("custom_button.add_title"))
         win.transient(self.root)
         win.grab_set()
         win.resizable(False, False)
         win.configure(background=self.theme["bg"])
         ttk.Label(
             win, wraplength=360, justify="left",
-            text="Name the button and pick where on screen it appears, then drag "
-                 "a box over it. The macro clicks it whenever it sees it."
+            text=t("custom_button.add_instructions")
         ).pack(fill="x", padx=14, pady=(14, 8))
 
         nrow = ttk.Frame(win)
         nrow.pack(fill="x", padx=14, pady=4)
-        ttk.Label(nrow, text="Name:").pack(side="left")
+        ttk.Label(nrow, text=t("custom_button.name_label")).pack(side="left")
         nvar = tk.StringVar()
         ttk.Entry(nrow, textvariable=nvar, width=24).pack(side="left", padx=(6, 0))
         zvar = self._zone_row(win)
@@ -2787,24 +2944,27 @@ class App:
             safe = "".join(c for c in nvar.get()
                            if c.isalnum() or c in " -_").strip()
             if not safe:
-                messagebox.showerror("Custom button",
-                                     "Please enter a valid name.", parent=win)
+                messagebox.showerror(t("custom_button.invalid_name_title"),
+                                     t("custom_button.invalid_name_body"),
+                                     parent=win)
                 return
             path = config.REF_CUSTOM_DIR / f"{safe}.png"
             if path.exists() and not messagebox.askyesno(
-                    "Custom button",
-                    f"A custom button named '{safe}' already exists. Replace it?",
+                    t("custom_button.already_exists_title"),
+                    t("custom_button.already_exists_body", name=safe),
                     parent=win):
                 return
             zone = zvar.get()
             win.destroy()
             self._capture_crop_to(
                 path,
-                f"Capture custom button '{safe}':  drag a box over it, then Confirm",
+                t("custom_button.capture_title", name=safe),
                 after_save=self._render_custom_buttons, zone=zone)
 
-        ttk.Button(btns, text="Cancel", command=win.destroy).pack(side="right")
-        ttk.Button(btns, text="Capture", command=go).pack(side="right", padx=(0, 6))
+        ttk.Button(btns, text=t("capture.cancel"),
+                   command=win.destroy).pack(side="right")
+        ttk.Button(btns, text=t("custom_button.capture"),
+                   command=go).pack(side="right", padx=(0, 6))
 
     def _recapture_ref(self):
         """Recapture a built-in reference image (ref/*.png) from a live ADB
@@ -2813,31 +2973,26 @@ class App:
         if self._coords_busy:
             return
         if self._running:
-            main.log("stop the macro before recapturing a ref")
+            main.log(t("capture.stop_macro_before_ref"))
             return
 
         refs = sorted(p.name for p in config.REF_DIR.glob("*.png") if p.is_file())
         existing = config.load_ref_zones()
 
         win = tk.Toplevel(self.root)
-        win.title("Capture / recapture reference image")
+        win.title(t("ref.recapture_title"))
         win.transient(self.root)
         win.grab_set()
         win.resizable(False, False)
         win.configure(background=self.theme["bg"])
         ttk.Label(
             win, wraplength=400, justify="left",
-            text="Pick an existing reference to recapture, OR type a new name to "
-                 "capture a brand-new ref. Choose where on screen it appears, "
-                 "then drag a box tightly around it (saved at the standard match "
-                 "scale, so any device works).\n\n"
-                 "A new ref is only saved for later -- the macro uses it only "
-                 "once you wire it up in code."
+            text=t("ref.recapture_instructions")
         ).pack(fill="x", padx=14, pady=(14, 8))
 
         row = ttk.Frame(win)
         row.pack(fill="x", padx=14, pady=4)
-        ttk.Label(row, text="Reference:").pack(side="left")
+        ttk.Label(row, text=t("ref.reference_label")).pack(side="left")
         var = tk.StringVar(value=refs[0] if refs else "")
         # Editable on purpose: select an existing ref, or type a new name.
         ttk.Combobox(row, textvariable=var, values=refs,
@@ -2859,25 +3014,257 @@ class App:
             base = raw[:-4] if raw.lower().endswith(".png") else raw
             safe = "".join(c for c in base if c.isalnum() or c in " -_").strip()
             if not safe:
-                messagebox.showerror("Reference",
-                                     "Enter or pick a reference name.", parent=win)
+                messagebox.showerror(t("ref.name_required_title"),
+                                     t("ref.name_required_body"), parent=win)
                 return
             fname = f"{safe}.png"
             path = config.REF_DIR / fname
             zone = zvar.get()
-            verb = "Recapture" if path.exists() else "Capture new ref"
+            verb = (t("ref.verb_recapture") if path.exists()
+                    else t("ref.verb_capture_new"))
             if path.exists() and not messagebox.askyesno(
-                    "Reference", f"'{fname}' already exists. Replace it?",
+                    t("ref.name_required_title"),
+                    t("ref.already_exists_body", name=fname),
                     parent=win):
                 return
             win.destroy()
             self._capture_crop_to(
                 path,
-                f"{verb} '{fname}':  drag a box over it, then Confirm",
+                t("ref.capture_title", verb=verb, name=fname),
                 zone=zone)
 
-        ttk.Button(btns, text="Cancel", command=win.destroy).pack(side="right")
-        ttk.Button(btns, text="Capture", command=go).pack(side="right", padx=(0, 6))
+        ttk.Button(btns, text=t("capture.cancel"),
+                   command=win.destroy).pack(side="right")
+        ttk.Button(btns, text=t("custom_button.capture"),
+                   command=go).pack(side="right", padx=(0, 6))
+
+    # ------------------------------------------------------------------
+    # Language ref wizard: walk each text-bearing ref (config.LOCALIZED_REFS)
+    # and recapture it in the game's other language, saving to ref/<lang>/.
+    # Reuses the ADB-screenshot + rubber-band crop flow (_capture_crop_to),
+    # which already creates parent folders and stores at the MATCH_WIDTH
+    # baseline.  Missing variants fall back to English at match time.
+    # ------------------------------------------------------------------
+    def _recapture_language_refs(self):
+        """Open the 'recapture refs for language X' wizard."""
+        if self._coords_busy:
+            return
+        if self._running:
+            main.log(t("capture.stop_macro_before_ref"))
+            return
+
+        # Language codes that own a ref/<lang>/ folder (English is the default
+        # ref/ set, so it is never a capture target).
+        codes = [c for c in config.REF_LANG_FOLDERS
+                 if c != config.DEFAULT_REF_LANGUAGE]
+        if not codes:
+            return
+        names = dict(i18n.available_languages())
+        # Default the picker to the current GUI/game language when it is one of
+        # the variant languages, else the first variant.
+        default = config.LANGUAGE if config.LANGUAGE in codes else codes[0]
+
+        win = tk.Toplevel(self.root)
+        win.title(t("ref_wizard.title"))
+        win.transient(self.root)
+        win.grab_set()
+        win.resizable(False, False)
+        win.configure(background=self.theme["bg"])
+        set_dark_titlebar(win, self.dark)
+        ttk.Label(
+            win, wraplength=420, justify="left",
+            text=t("ref_wizard.intro")
+        ).pack(fill="x", padx=14, pady=(14, 8))
+
+        row = ttk.Frame(win)
+        row.pack(fill="x", padx=14, pady=4)
+        ttk.Label(row, text=t("ref_wizard.language_label")).pack(side="left")
+        lvar = tk.StringVar(value=default)
+        ttk.Combobox(
+            row, textvariable=lvar, state="readonly", width=16,
+            values=[f"{names.get(c, c)} ({c})" for c in codes]
+        ).pack(side="left", padx=(6, 0))
+        # Show the display label but resolve back to the code on start.
+        label_to_code = {f"{names.get(c, c)} ({c})": c for c in codes}
+        lvar.set(f"{names.get(default, default)} ({default})")
+
+        btns = ttk.Frame(win)
+        btns.pack(fill="x", padx=14, pady=(10, 14))
+
+        def start():
+            code = label_to_code.get(lvar.get(), default)
+            win.destroy()
+            self._lang_wizard_step(code, 0, set(), set())
+
+        ttk.Button(btns, text=t("ref_wizard.cancel"),
+                   command=win.destroy).pack(side="right")
+        ttk.Button(btns, text=t("ref_wizard.start"),
+                   command=start).pack(side="right", padx=(0, 6))
+
+    def _lang_wizard_step(self, lang, index, captured, skipped):
+        """Show the wizard step for LOCALIZED_REFS[index] in `lang`.
+
+        `captured` / `skipped` are the sets of ref-relative paths handled so
+        far, carried through the walk so the final summary is accurate."""
+        refs = config.LOCALIZED_REFS
+        if index >= len(refs):
+            self._lang_wizard_summary(lang, captured, skipped)
+            return
+
+        rel = refs[index]                       # POSIX ref-relative path
+        english_path = config.REF_DIR / rel
+        target_path = config.REF_DIR / lang / rel
+        names = dict(i18n.available_languages())
+        lang_name = names.get(lang, lang)
+
+        win = tk.Toplevel(self.root)
+        win.title(t("ref_wizard.step_title", lang=lang_name))
+        win.transient(self.root)
+        win.grab_set()
+        win.resizable(False, False)
+        win.configure(background=self.theme["bg"])
+        set_dark_titlebar(win, self.dark)
+
+        ttk.Label(
+            win, wraplength=440, justify="left", font=(ui_font(), 10, "bold"),
+            text=t("ref_wizard.step_heading",
+                   n=index + 1, total=len(refs), name=rel)
+        ).pack(fill="x", padx=14, pady=(14, 2))
+        ttk.Label(
+            win, wraplength=440, justify="left",
+            text=t("ref_wizard.step_instruction", lang=lang_name)
+        ).pack(fill="x", padx=14, pady=(0, 8))
+
+        # English example (top) and, if present, the already-captured variant.
+        imgrow = tk.Frame(win, bg=self.theme["bg"])
+        imgrow.pack(fill="x", padx=14, pady=4)
+        self._wizard_thumb_refs = []
+
+        def _example(parent, path, caption):
+            col = tk.Frame(parent, bg=self.theme["bg"])
+            tk.Label(col, text=caption, bg=self.theme["bg"],
+                     fg=self.theme["fg_dim"], font=(ui_font(), 8)).pack()
+            box = tk.Frame(col, background="white")
+            box.pack(padx=2, pady=2)
+            photo = self._custom_button_thumb(path, 160) if path.exists() else None
+            if photo is not None:
+                self._wizard_thumb_refs.append(photo)
+                tk.Label(box, image=photo, background="white").pack()
+            else:
+                tk.Label(box, text=t("ref_wizard.no_image"), width=16, height=3,
+                         background="white", foreground="#999").pack()
+            return col
+
+        _example(imgrow, english_path,
+                 t("ref_wizard.example_english")).pack(side="left", padx=(0, 10))
+        have_variant = target_path.exists()
+        if have_variant:
+            _example(imgrow, target_path,
+                     t("ref_wizard.captured_variant", lang=lang_name)).pack(
+                         side="left")
+
+        status = ttk.Label(win, wraplength=440, justify="left", foreground="#4a4",
+                           text=t("ref_wizard.status_captured", lang=lang_name)
+                           if have_variant else "")
+        status.pack(fill="x", padx=14, pady=(2, 4))
+
+        btns = ttk.Frame(win)
+        btns.pack(fill="x", padx=14, pady=(8, 14))
+
+        def go_next():
+            if target_path.exists():
+                captured.add(rel)
+            win.destroy()
+            self._lang_wizard_step(lang, index + 1, captured, skipped)
+
+        def go_skip():
+            skipped.add(rel)
+            captured.discard(rel)
+            win.destroy()
+            self._lang_wizard_step(lang, index + 1, captured, skipped)
+
+        def go_cancel():
+            win.destroy()
+            self._lang_wizard_summary(lang, captured, skipped, cancelled=True)
+
+        def go_capture():
+            # Reuse the shared capture flow; it creates ref/<lang>/ as needed
+            # and stores at the MATCH_WIDTH baseline. On save, re-open this same
+            # step so the user sees the result and can Redo or advance.  The zone
+            # is inherited from the English ref's ref_zones.json entry (keyed by
+            # base name), so no zone is written for the variant.
+            win.destroy()
+
+            def after():
+                skipped.discard(rel)
+                captured.add(rel)
+                self._lang_wizard_step(lang, index, captured, skipped)
+
+            self._capture_crop_to(
+                target_path,
+                t("ref_wizard.capture_title", name=rel, lang=lang_name),
+                after_save=after)
+
+        cap_label = (t("ref_wizard.recapture") if have_variant
+                     else t("ref_wizard.capture"))
+        ttk.Button(btns, text=t("ref_wizard.cancel"),
+                   command=go_cancel).pack(side="left")
+        ttk.Button(btns, text=t("ref_wizard.skip"),
+                   command=go_skip).pack(side="right")
+        if have_variant:
+            ttk.Button(btns, text=t("ref_wizard.next"),
+                       command=go_next).pack(side="right", padx=(0, 6))
+        ttk.Button(btns, text=cap_label,
+                   command=go_capture).pack(side="right", padx=(0, 6))
+
+    def _lang_wizard_summary(self, lang, captured, skipped, cancelled=False):
+        """Final wizard dialog: which refs were captured, which are missing."""
+        names = dict(i18n.available_languages())
+        lang_name = names.get(lang, lang)
+        # Recompute from disk so the summary reflects reality, not just the
+        # sets threaded through the walk.
+        done, missing = [], []
+        for rel in config.LOCALIZED_REFS:
+            if (config.REF_DIR / lang / rel).exists():
+                done.append(rel)
+            else:
+                missing.append(rel)
+
+        win = tk.Toplevel(self.root)
+        win.title(t("ref_wizard.summary_title"))
+        win.transient(self.root)
+        win.grab_set()
+        win.resizable(False, False)
+        win.configure(background=self.theme["bg"])
+        set_dark_titlebar(win, self.dark)
+
+        head = (t("ref_wizard.summary_cancelled", lang=lang_name) if cancelled
+                else t("ref_wizard.summary_done", lang=lang_name))
+        ttk.Label(win, wraplength=440, justify="left",
+                  font=(ui_font(), 10, "bold"), text=head).pack(
+                      fill="x", padx=14, pady=(14, 6))
+        ttk.Label(
+            win, wraplength=440, justify="left",
+            text=t("ref_wizard.summary_counts",
+                   done=len(done), total=len(config.LOCALIZED_REFS),
+                   missing=len(missing))
+        ).pack(fill="x", padx=14, pady=(0, 6))
+        if missing:
+            ttk.Label(
+                win, wraplength=440, justify="left", foreground="#c77",
+                text=t("ref_wizard.summary_missing",
+                       names=", ".join(missing))
+            ).pack(fill="x", padx=14, pady=(0, 6))
+        ttk.Label(
+            win, wraplength=440, justify="left", foreground=self.theme["fg_dim"],
+            text=t("ref_wizard.summary_fallback")
+        ).pack(fill="x", padx=14, pady=(0, 8))
+
+        ttk.Button(win, text=t("ref_wizard.close"),
+                   command=win.destroy).pack(padx=14, pady=(4, 14))
+        main.log(t("ref_wizard.log_summary",
+                   lang=lang, done=len(done),
+                   total=len(config.LOCALIZED_REFS)))
 
     # conduct movement (used by settings panel movement tuning)
     def _conduct_plant_movement(self):
@@ -2930,7 +3317,7 @@ class App:
 
         win = tk.Toplevel(self.root)
         self._picker = win
-        win.title("Add skills")
+        win.title(t("picker.add_skills_title"))
         win.geometry("820x580")
         win.transient(self.root)
         win.configure(background=self.theme["bg"])
@@ -2941,7 +3328,8 @@ class App:
         head = tk.Frame(win, bg=self.theme["bg"], highlightthickness=0)
         head.pack(fill="x", padx=12, pady=(10, 6))
 
-        tk.Label(head, text="Add skills", font=(ui_font(), 12, "bold"),
+        tk.Label(head, text=t("picker.add_skills_title"),
+                 font=(ui_font(), 12, "bold"),
                  fg=self.theme["fg"], bg=self.theme["bg"]).pack(
                      side="left")
 
@@ -2950,7 +3338,7 @@ class App:
         self._picker_toggle = SegmentToggle(
             head, variable=self._picker_mode_var,
             command=self._on_picker_toggle,
-            labels=("Priority", "Avoid"),
+            labels=(t("picker.priority"), t("picker.avoid")),
             left_color=_CUSTOM_COLOR, right_color=_AVOID_COLOR,
             container_bg=self.theme["inset"],
             label_fg=self.theme["fg_dim"],
@@ -2976,7 +3364,7 @@ class App:
             bg=self.theme["bg"], font=(ui_font(), 8))
         self._picker_hint.pack(side="right", padx=(0, 8))
         self._picker_done_btn = RoundedButton(
-            footer, text="Done", command=win.destroy,
+            footer, text=t("picker.done"), command=win.destroy,
             bg=self.theme["accent"], fg="#ffffff",
             font=(ui_font(), 9, "bold"), radius=6,
             canvas_bg=self.theme["bg"])
@@ -3029,15 +3417,16 @@ class App:
         if getattr(self, "_picker_counts", None) is not None:
             try:
                 self._picker_counts.configure(
-                    text=f"● {len(self.custom)} priority   "
-                         f"● {len(self.avoid)} avoid")
+                    text=t("picker.footer_counts", custom=len(self.custom),
+                           avoid=len(self.avoid)))
             except tk.TclError:
                 pass
         if getattr(self, "_picker_hint", None) is not None:
-            action = "prioritise" if self._picker_mode != "avoid" else "avoid"
+            hint = (t("picker.click_to_avoid")
+                    if self._picker_mode == "avoid"
+                    else t("picker.click_to_prioritise"))
             try:
-                self._picker_hint.configure(
-                    text=f"Click a tile to {action} it")
+                self._picker_hint.configure(text=hint)
             except tk.TclError:
                 pass
 
@@ -3062,9 +3451,7 @@ class App:
         if not any(idents for _, idents in all_skills):
             tk.Label(body, foreground="#999", bg=p["bg"],
                      wraplength=580, font=(ui_font(), 9),
-                     text="No skill images found. Add PNG icons to the "
-                          "skills/ category subfolders, then reopen this "
-                          "window.").pack(padx=12, pady=24)
+                     text=t("picker.no_skills_found")).pack(padx=12, pady=24)
             return
 
         prio_hashes = self._hashes_of(self.custom)
@@ -3075,7 +3462,8 @@ class App:
             if not idents:
                 continue
 
-            cat_label = f"{category.upper()}  ·  {len(idents)}"
+            cat_label = t("picker.category_label",
+                          category=category.upper(), count=len(idents))
             tk.Label(body, text=cat_label, font=(ui_font(), 8, "bold"),
                      foreground=p["fg_muted"], bg=p["bg"]).pack(
                          anchor="w", padx=8, pady=(10, 4))
@@ -3115,7 +3503,7 @@ class App:
 
         win = tk.Toplevel(self.root)
         self._settings_win = win
-        win.title("Settings")
+        win.title(t("settings.title"))
         win.geometry("480x640")
         win.transient(self.root)
         win.configure(background=self.theme["bg"])
@@ -3127,7 +3515,7 @@ class App:
         head.pack(fill="x", padx=12, pady=(12, 8))
         ttk.Label(head, text="⚙", font=("", 14),
                   foreground=self.theme["accent"]).pack(side="left")
-        ttk.Label(head, text="Settings", font=("", 13, "bold")).pack(
+        ttk.Label(head, text=t("settings.title"), font=("", 13, "bold")).pack(
             side="left", padx=(6, 0))
         ttk.Button(head, text="✕", width=3,
                    command=win.destroy).pack(side="right")
@@ -3156,7 +3544,7 @@ class App:
         btn_row = ttk.Frame(body)
         btn_row.pack(fill="x", padx=8, pady=(8, 6))
         wiz_btn = tk.Button(
-            btn_row, text="✦  Setup Wizard",
+            btn_row, text=t("settings.setup_wizard"),
             command=self._run_setup_wizard,
             font=("", 9, "bold"), foreground="#ffffff",
             background=self.theme["accent"],
@@ -3164,29 +3552,44 @@ class App:
             activeforeground="#ffffff", relief="flat", cursor="hand2",
             padx=10, pady=5)
         wiz_btn.pack(side="left", expand=True, fill="x", padx=(0, 4))
-        Tooltip(wiz_btn, "Connect a device, detect resolution, set defaults.")
-        test_btn = ttk.Button(btn_row, text="⚡  Test connection",
+        Tooltip(wiz_btn, t("settings.setup_wizard_tooltip"))
+        test_btn = ttk.Button(btn_row, text=t("settings.test_connection"),
                                command=self._test_adb_connection)
         test_btn.pack(side="left", expand=True, fill="x", padx=(4, 0))
-        Tooltip(test_btn, "Take an ADB screenshot to confirm the connection.")
+        Tooltip(test_btn, t("settings.test_connection_tooltip"))
         self._coord_buttons.append(test_btn)
 
         ttk.Separator(body).pack(fill="x", padx=8, pady=4)
 
+        # Display language (persists immediately; relabels on restart)
+        self._sp_build_language(body)
+
         # Timing
-        self._sp_group(body, "Timing", "How often the macro looks and acts",
-                       default_open=True, fields=[
-            ("POLL_INTERVAL", "Poll interval", "seconds"),
-            ("ACTION_DELAY", "Action delay", "seconds"),
-            ("STARTUP_DELAY", "Startup delay", "seconds"),
-            ("SKILL_SETTLE_DELAY", "Skill settle delay", "seconds"),
+        self._sp_group(body, t("settings.group.timing"),
+                       t("settings.group.timing_sub"),
+                       default_open=True, icon=("⏱", None), fields=[
+            ("POLL_INTERVAL", t("settings.field.poll_interval"),
+             t("settings.unit.seconds")),
+            ("ACTION_DELAY", t("settings.field.action_delay"),
+             t("settings.unit.seconds")),
+            ("STARTUP_DELAY", t("settings.field.startup_delay"),
+             t("settings.unit.seconds")),
+            ("SKILL_SETTLE_DELAY", t("settings.field.skill_settle_delay"),
+             t("settings.unit.seconds")),
         ])
         # Humanisation
-        self._sp_group(body, "Humanisation",
-                       "Add randomness so taps look human", fields=[
-            ("CLICK_JITTER", "Click jitter", "px"),
-            ("DELAY_JITTER", "Delay jitter", "fraction"),
+        self._sp_group(body, t("settings.group.humanisation"),
+                       t("settings.group.humanisation_sub"),
+                       icon=("~", None), fields=[
+            ("CLICK_JITTER", t("settings.field.click_jitter"),
+             t("settings.unit.px")),
+            ("DELAY_JITTER", t("settings.field.delay_jitter"),
+             t("settings.unit.fraction")),
         ])
+        # Root fast input (sendevent) + humanized taps
+        self._sp_build_fast_input(body)
+        # Remote status/control (optional; off by default)
+        self._sp_build_remote(body)
         # Custom buttons
         self._sp_build_custom_buttons(body)
         # Reference images
@@ -3203,41 +3606,42 @@ class App:
                  background=warn_bg).pack(side="left")
         tk.Label(warn_frame, font=("", 8),
                  foreground=self.theme["warn"], background=warn_bg,
-                 text="Advanced - only touch these if you know what you're "
-                 "doing.").pack(side="left", padx=(8, 0))
+                 text=t("settings.advanced_warning")).pack(
+                     side="left", padx=(8, 0))
 
         # Template matching (advanced)
-        self._sp_group(body, "Template matching",
-                       "Detection thresholds & scaling", fields=[
-            ("MATCH_THRESHOLD", "Skill threshold", "0-1"),
-            ("REF_THRESHOLD", "UI threshold", "0-1"),
-            ("SKILL_DOWNSCALE", "Skill downscale", "factor"),
-            ("REF_DOWNSCALE", "Ref downscale", "factor"),
-            ("CALIBRATED_SCALE", "Calibrated scale", None),
+        self._sp_group(body, t("settings.group.template_matching"),
+                       t("settings.group.template_matching_sub"),
+                       icon=("◎", "advanced"), fields=[
+            ("MATCH_THRESHOLD", t("settings.field.skill_threshold"),
+             t("settings.unit.0to1")),
+            ("REF_THRESHOLD", t("settings.field.ui_threshold"),
+             t("settings.unit.0to1")),
+            ("SKILL_DOWNSCALE", t("settings.field.skill_downscale"),
+             t("settings.unit.factor")),
+            ("REF_DOWNSCALE", t("settings.field.ref_downscale"),
+             t("settings.unit.factor")),
+            ("CALIBRATED_SCALE", t("settings.field.calibrated_scale"), None),
         ])
         # Movement tuning (advanced)
         self._sp_build_movement_tuning(body)
         # Capture lives at the very bottom of the advanced section now, with a
         # yellow (advanced) icon to match the rest.
-        self._sp_group(body, "Capture",
-                       "How frames are pulled from the device", fields=[
-            ("USE_STREAM_CAPTURE", "Stream capture (screenrecord)", None),
+        self._sp_group(body, t("settings.group.capture"),
+                       t("settings.group.capture_sub"),
+                       icon=("⊙", "advanced"), fields=[
+            ("USE_STREAM_CAPTURE", t("settings.field.stream_capture"), None),
         ])
 
         win.protocol("WM_DELETE_WINDOW", win.destroy)
 
-    _SP_ICONS = {
-        "Timing": ("⏱", None),
-        "Capture": ("⊙", "advanced"),
-        "Humanisation": ("~", None),
-        "Custom buttons": ("⊕", None),
-        "Reference images": ("⊞", None),
-        "Template matching": ("◎", "advanced"),
-        "Movement tuning": ("↗", "advanced"),
-    }
+    def _sp_group(self, parent, title, sub, fields, default_open=False,
+                  icon=("●", None)):
+        """Build an accordion settings group with label+field rows.
 
-    def _sp_group(self, parent, title, sub, fields, default_open=False):
-        """Build an accordion settings group with label+field rows."""
+        `icon` is a (char, advanced) tuple passed explicitly by the caller so
+        the group title can be translated freely without an English-title
+        lookup table getting out of sync."""
         p = self.theme
         outer = RoundedSection(
             parent, title="", bg=p["surface"],
@@ -3249,7 +3653,7 @@ class App:
                           cursor="hand2", highlightthickness=0)
         header.pack(fill="x")
 
-        icon_char, advanced = self._SP_ICONS.get(title, ("●", None))
+        icon_char, advanced = icon
         icon_color = p["warn"] if advanced else p["accent"]
         icon_lbl = tk.Label(
             header, text=icon_char, font=(ui_font(), 10),
@@ -3326,6 +3730,591 @@ class App:
                     ttk.Entry(cell, textvariable=sv, width=6).pack(
                         side="left", padx=(0, 4))
 
+    def _sp_build_fast_input(self, parent):
+        """Root fast input (sendevent) + Humanized taps toggles.
+
+        Two checkboxes plus a 'needs rooted BlueStacks / writable /dev/input'
+        warning. Humanized taps is greyed out and unclickable until Root fast
+        input is on; enabling Humanized taps shows a one-time speed warning."""
+        p = self.theme
+        outer = RoundedSection(
+            parent, title="", bg=p["surface"],
+            border_color=p["border"], radius=6,
+            parent_bg=p["bg"])
+        outer.pack(fill="x", padx=8, pady=3)
+
+        header = tk.Frame(outer.inner, bg=p["surface"],
+                          cursor="hand2", highlightthickness=0)
+        header.pack(fill="x")
+        tk.Label(header, text="⚡", font=(ui_font(), 10),
+                 foreground=p["accent"], background=p["surface"],
+                 width=3, cursor="hand2").pack(side="left", padx=(0, 4))
+        title_frame = tk.Frame(header, bg=p["surface"],
+                               cursor="hand2", highlightthickness=0)
+        title_frame.pack(side="left", fill="x", expand=True)
+        tk.Label(title_frame, text=t("fast_input.section_title"),
+                 font=(ui_font(), 9, "bold"), fg=p["fg"], bg=p["surface"],
+                 cursor="hand2").pack(anchor="w")
+        tk.Label(title_frame, text=t("fast_input.section_sub"),
+                 fg=p["fg_muted"], bg=p["surface"], font=(ui_font(), 8),
+                 cursor="hand2").pack(anchor="w")
+        chev = tk.Label(header, text="▸", width=2, cursor="hand2",
+                        font=(ui_font(), 10), fg=p["fg_dim"], bg=p["surface"])
+        chev.pack(side="right")
+
+        body = tk.Frame(outer.inner, bg=p["surface"], highlightthickness=0)
+
+        def toggle(e=None):
+            if body.winfo_ismapped():
+                body.pack_forget()
+                chev.configure(text="▸")
+            else:
+                body.pack(fill="x", padx=(16, 0), pady=(4, 4))
+                chev.configure(text="▾")
+
+        for w in (header,) + tuple(header.winfo_children()):
+            w.bind("<Button-1>", toggle)
+
+        root_var = self.vars["ROOT_FAST_INPUT"]
+        human_var = self.vars["HUMANIZED_TAPS"]
+
+        # Root fast input row
+        row1 = tk.Frame(body, bg=p["surface"], highlightthickness=0)
+        row1.pack(fill="x", pady=2)
+        lbl1 = tk.Label(row1, text=t("fast_input.root_label"), fg=p["fg_dim"],
+                        bg=p["surface"], font=(ui_font(), 9))
+        lbl1.pack(side="left")
+        Tooltip(lbl1, t("fast_input.root_hint"))
+        RoundedCheckbox(
+            row1, text="", variable=root_var,
+            checked_color=p["accent"], unchecked_color=p["surface_3"],
+            text_color=p["fg_dim"], canvas_bg=p["surface"],
+            command=self._on_root_fast_input_toggled).pack(side="right")
+
+        # Required-root warning line
+        warn1 = tk.Label(body, text=t("fast_input.root_required_warning"),
+                         fg=p["warn"], bg=p["surface"], font=(ui_font(), 8),
+                         wraplength=560, justify="left")
+        warn1.pack(anchor="w", pady=(0, 4))
+
+        # Humanized taps row (greyed until root fast input is on)
+        row2 = tk.Frame(body, bg=p["surface"], highlightthickness=0)
+        row2.pack(fill="x", pady=2)
+        self._human_taps_label = tk.Label(
+            row2, text=t("fast_input.humanized_label"), fg=p["fg_dim"],
+            bg=p["surface"], font=(ui_font(), 9))
+        self._human_taps_label.pack(side="left")
+        Tooltip(self._human_taps_label, t("fast_input.humanized_hint"))
+        self._human_taps_cb = RoundedCheckbox(
+            row2, text="", variable=human_var,
+            checked_color=p["accent"], unchecked_color=p["surface_3"],
+            text_color=p["fg_dim"], canvas_bg=p["surface"],
+            command=self._on_humanized_taps_toggled)
+        self._human_taps_cb.pack(side="right")
+
+        # Speed warning shown under the humanized row.
+        tk.Label(body, text=t("fast_input.humanized_speed_warning"),
+                 fg=p["fg_muted"], bg=p["surface"], font=(ui_font(), 8),
+                 wraplength=560, justify="left").pack(anchor="w")
+
+        self._refresh_humanized_enabled()
+
+    def _refresh_humanized_enabled(self):
+        """Grey / ungrey the Humanized taps checkbox to match Root fast input.
+
+        The RoundedCheckbox has no disabled state, so 'disabled' is conveyed by
+        dimming its colours and label; the actual click guard lives in
+        _on_humanized_taps_toggled (it reverts a toggle made while root is off)."""
+        cb = getattr(self, "_human_taps_cb", None)
+        if cb is None:
+            return
+        p = self.theme
+        enabled = bool(self.vars["ROOT_FAST_INPUT"].get())
+        if enabled:
+            cb.update_colors(checked_color=p["accent"],
+                             unchecked_color=p["surface_3"],
+                             text_color=p["fg_dim"])
+            self._human_taps_label.configure(fg=p["fg_dim"])
+        else:
+            cb.update_colors(checked_color=p["border"],
+                             unchecked_color=p["surface_2"],
+                             text_color=p["border"])
+            self._human_taps_label.configure(fg=p["border"])
+
+    def _on_root_fast_input_toggled(self):
+        """Live-update the Humanized taps enabled state when root input flips.
+
+        Autosave is handled by the var trace (see _wire_autosave_traces), so no
+        explicit save is needed here."""
+        self._refresh_humanized_enabled()
+
+    def _on_humanized_taps_toggled(self):
+        """Guard the Humanized taps toggle: it does nothing while Root fast input
+        is off (reverts), and warns once about the All-Star speed cost when
+        turned on. Autosave rides on the var trace."""
+        if not self.vars["ROOT_FAST_INPUT"].get():
+            # Clicked while disabled: revert and nudge the user.
+            self.vars["HUMANIZED_TAPS"].set(False)
+            messagebox.showinfo(
+                t("fast_input.humanized_label"),
+                t("fast_input.humanized_needs_root"))
+            return
+        if self.vars["HUMANIZED_TAPS"].get():
+            messagebox.showwarning(
+                t("fast_input.humanized_label"),
+                t("fast_input.humanized_speed_warning"))
+
+    # ------------------------------------------------------------------ remote
+    def _sp_build_remote(self, parent):
+        """Remote status/control accordion: enable toggle, relay + web page
+        URLs, masked token, Copy pairing link / Regenerate token, and the
+        companion status line. See the module-level _REMOTE_* helpers and the
+        _remote_* methods below for the file-based IPC and companion lifecycle;
+        the main app itself never touches the network."""
+        p = self.theme
+        outer = RoundedSection(
+            parent, title="", bg=p["surface"],
+            border_color=p["border"], radius=6, parent_bg=p["bg"])
+        outer.pack(fill="x", padx=8, pady=3)
+
+        header = tk.Frame(outer.inner, bg=p["surface"], cursor="hand2",
+                          highlightthickness=0)
+        header.pack(fill="x")
+        tk.Label(header, text="☁", font=(ui_font(), 10),
+                 foreground=p["accent"], background=p["surface"],
+                 width=3, cursor="hand2").pack(side="left", padx=(0, 4))
+        title_frame = tk.Frame(header, bg=p["surface"], cursor="hand2",
+                               highlightthickness=0)
+        title_frame.pack(side="left", fill="x", expand=True)
+        tk.Label(title_frame, text=t("remote.title"),
+                 font=(ui_font(), 9, "bold"), fg=p["fg"], bg=p["surface"],
+                 cursor="hand2").pack(anchor="w")
+        tk.Label(title_frame, text=t("remote.section_sub"),
+                 fg=p["fg_muted"], bg=p["surface"], font=(ui_font(), 8),
+                 cursor="hand2").pack(anchor="w")
+        chev = tk.Label(header, text="▸", width=2, cursor="hand2",
+                        font=(ui_font(), 10), fg=p["fg_dim"], bg=p["surface"])
+        chev.pack(side="right")
+
+        body = tk.Frame(outer.inner, bg=p["surface"], highlightthickness=0)
+
+        def toggle(e=None):
+            if body.winfo_ismapped():
+                body.pack_forget()
+                chev.configure(text="▸")
+            else:
+                body.pack(fill="x", padx=(16, 0), pady=(4, 4))
+                chev.configure(text="▾")
+
+        for w in (header,) + tuple(header.winfo_children()):
+            w.bind("<Button-1>", toggle)
+        for w in tuple(title_frame.winfo_children()):
+            w.bind("<Button-1>", toggle)
+
+        # Enable row
+        row_en = tk.Frame(body, bg=p["surface"], highlightthickness=0)
+        row_en.pack(fill="x", pady=2)
+        lbl_en = tk.Label(row_en, text=t("remote.enable"), fg=p["fg_dim"],
+                          bg=p["surface"], font=(ui_font(), 9))
+        lbl_en.pack(side="left")
+        Tooltip(lbl_en, t("remote.enable_tooltip"))
+        RoundedCheckbox(
+            row_en, text="", variable=self.remote_enabled_var,
+            checked_color=p["accent"], unchecked_color=p["surface_3"],
+            text_color=p["fg_dim"], canvas_bg=p["surface"],
+            command=self._on_remote_enabled_toggled).pack(side="right")
+
+        # Relay URL
+        tk.Label(body, text=t("remote.relay_url"), fg=p["fg_dim"],
+                 bg=p["surface"], font=(ui_font(), 9)).pack(
+                     anchor="w", pady=(4, 0))
+        relay_entry = ttk.Entry(body, textvariable=self.remote_relay_var)
+        relay_entry.pack(fill="x", pady=(1, 2))
+        Tooltip(relay_entry, t("remote.relay_tooltip"))
+
+        # Web page URL
+        tk.Label(body, text=t("remote.pages_url"), fg=p["fg_dim"],
+                 bg=p["surface"], font=(ui_font(), 9)).pack(
+                     anchor="w", pady=(4, 0))
+        pages_entry = ttk.Entry(body, textvariable=self.remote_pages_var)
+        pages_entry.pack(fill="x", pady=(1, 2))
+        Tooltip(pages_entry, t("remote.pages_tooltip"))
+
+        # Token (masked to the first 6 chars)
+        row_tok = tk.Frame(body, bg=p["surface"], highlightthickness=0)
+        row_tok.pack(fill="x", pady=(4, 2))
+        tk.Label(row_tok, text=t("remote.token_label"), fg=p["fg_dim"],
+                 bg=p["surface"], font=(ui_font(), 9)).pack(side="left")
+        self._remote_token_label = tk.Label(
+            row_tok, text=self._remote_token_display(), fg=p["fg_muted"],
+            bg=p["surface"], font=(ui_font(), 9))
+        self._remote_token_label.pack(side="left", padx=(6, 0))
+
+        # Buttons
+        row_btn = tk.Frame(body, bg=p["surface"], highlightthickness=0)
+        row_btn.pack(fill="x", pady=(4, 2))
+        copy_btn = ttk.Button(row_btn, text=t("remote.copy_link"),
+                              command=self._remote_copy_pairing_link)
+        copy_btn.pack(side="left")
+        Tooltip(copy_btn, t("remote.copy_link_tooltip"))
+        regen_btn = ttk.Button(row_btn, text=t("remote.regen"),
+                               command=self._remote_regenerate_token)
+        regen_btn.pack(side="left", padx=(6, 0))
+        Tooltip(regen_btn, t("remote.regen_tooltip"))
+
+        # Companion status line (refreshed by _remote_tick while enabled)
+        self._remote_status_label = tk.Label(
+            body, text="", fg=p["fg_muted"], bg=p["surface"],
+            font=(ui_font(), 8), wraplength=560, justify="left")
+        self._remote_status_label.pack(anchor="w", pady=(4, 2))
+        self._render_remote_status()
+
+    def _remote_token_display(self):
+        """Masked token for the settings panel: first 6 chars only, never the
+        whole secret."""
+        token = _remote_read_token()
+        if not token:
+            return t("remote.token_none")
+        return token[:6] + "…"
+
+    def _render_remote_token(self):
+        lbl = self._remote_token_label
+        if lbl is None:
+            return
+        try:
+            if not lbl.winfo_exists():
+                self._remote_token_label = None
+                return
+            lbl.configure(text=self._remote_token_display())
+        except tk.TclError:
+            self._remote_token_label = None
+
+    def _remote_generate_token(self):
+        """Create (or replace) the per-install secret. Returns the token, or
+        None if it could not be written. The token is never logged."""
+        token = secrets.token_urlsafe(32)
+        try:
+            _REMOTE_TOKEN_PATH.write_text(token, encoding="utf-8")
+        except OSError as e:
+            main.log(f"remote: could not write token file: {e}")
+            return None
+        self._render_remote_token()
+        return token
+
+    def _remote_regenerate_token(self):
+        if not messagebox.askyesno(t("remote.regen_confirm_title"),
+                                   t("remote.regen_confirm_body")):
+            return
+        if self._remote_generate_token() is None:
+            return
+        main.log("remote: token regenerated; old pairing links are now dead")
+        messagebox.showinfo(t("remote.regen_done_title"),
+                            t("remote.regen_done_body"))
+
+    def _remote_copy_pairing_link(self):
+        """Build the pairing link (<pages>#i=<id>&k=<token>&r=<relay>) and put
+        it on the clipboard. The secret rides only in the URL fragment, which
+        browsers never send to a server."""
+        relay = self.remote_relay_var.get().strip().rstrip("/")
+        pages = self.remote_pages_var.get().strip().rstrip("/")
+        if not relay or not pages:
+            messagebox.showwarning(t("remote.need_urls_title"),
+                                   t("remote.need_urls_body"))
+            return
+        low = relay.lower()
+        if not (low.startswith("https://")
+                or low.startswith("http://localhost")
+                or low.startswith("http://127.0.0.1")):
+            messagebox.showwarning(t("remote.need_urls_title"),
+                                   t("remote.need_https_body"))
+            return
+        token = _remote_read_token() or self._remote_generate_token()
+        if token is None:
+            return
+        link = f"{pages}#i={_remote_install_id(token)}&k={token}&r={relay}"
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(link)
+        except tk.TclError:
+            pass
+        messagebox.showinfo(t("remote.link_copied_title"),
+                            t("remote.link_copied_body"))
+
+    def _on_remote_enabled_toggled(self):
+        """Enable/disable the remote feature: create the token on first enable,
+        persist the new state so the companion sees it, then (re)start or stop
+        the companion + local IPC loop."""
+        enabled = bool(self.remote_enabled_var.get())
+        if enabled and _remote_read_token() is None:
+            self._remote_generate_token()
+        # Persist before touching the companion; it reads REMOTE_ENABLED and
+        # the relay URL straight from settings.json.
+        if not self._apply_and_save(quiet=True):
+            # A bad numeric field elsewhere blocked the full save; still persist
+            # the remote keys so the toggle is not silently lost.
+            config.apply_settings({
+                "REMOTE_ENABLED": enabled,
+                "REMOTE_RELAY_URL": self.remote_relay_var.get().strip(),
+                "REMOTE_PAGES_URL": self.remote_pages_var.get().strip(),
+            })
+            config.save_settings()
+        self._remote_sync_enabled()
+        self._render_remote_status()
+        main.log("remote access enabled" if enabled
+                 else "remote access disabled")
+
+    def _remote_sync_enabled(self):
+        """Match the running companion + IPC loop to config.REMOTE_ENABLED."""
+        if config.REMOTE_ENABLED:
+            self._remote_start_companion()
+            self._remote_start_ipc()
+        else:
+            self._remote_stop_ipc()
+            self._remote_stop_companion()
+
+    def _remote_start_companion(self):
+        if self._remote_proc is not None and self._remote_proc.poll() is None:
+            return                          # already running
+        try:
+            if getattr(sys, "frozen", False):
+                exe = config.BASE_DIR / "A2 Remote.exe"
+                if not exe.exists():
+                    main.log("remote: A2 Remote.exe not found next to the app")
+                    return
+                args = [str(exe)]
+            else:
+                args = [sys.executable,
+                        str(config.BASE_DIR / "remote_agent.py")]
+            self._remote_proc = subprocess.Popen(
+                args, cwd=str(config.BASE_DIR),
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            main.log("remote: companion started")
+        except OSError as e:
+            self._remote_proc = None
+            main.log(f"remote: could not start companion: {e}")
+
+    def _remote_stop_companion(self):
+        proc = self._remote_proc
+        self._remote_proc = None
+        if proc is None:
+            return
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+        except OSError:
+            pass
+
+    def _remote_start_ipc(self):
+        if self._remote_ipc_after is not None:
+            return
+        self._remote_last_status_write = 0.0
+        self._remote_tick()
+
+    def _remote_stop_ipc(self):
+        if self._remote_ipc_after is not None:
+            try:
+                self.root.after_cancel(self._remote_ipc_after)
+            except tk.TclError:
+                pass
+            self._remote_ipc_after = None
+        # Drop the shared status/command files so a reopened web page cannot act
+        # on stale data and no old command is replayed on the next enable.
+        for path in (_REMOTE_STATUS_PATH, _REMOTE_CMD_PATH):
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+    def _remote_tick(self):
+        """One IPC cycle on the tk main loop: refresh the status file (~3 s),
+        consume any pending command, update the status line, reschedule."""
+        self._remote_ipc_after = None
+        if not config.REMOTE_ENABLED:
+            return
+        now = time.time()
+        if now - self._remote_last_status_write >= 3.0:
+            self._remote_write_status()
+            self._remote_last_status_write = now
+        self._remote_poll_command()
+        self._render_remote_status()
+        try:
+            self._remote_ipc_after = self.root.after(1500, self._remote_tick)
+        except tk.TclError:
+            self._remote_ipc_after = None
+
+    def _on_activity(self, lines):
+        """Activity-sink callback (macro thread): store the concise summary for
+        the next remote status write. Atomic assignment, read on the UI thread."""
+        self._activity_lines = list(lines)
+
+    def _remote_write_status(self):
+        gm = (self._running_mode if (self._running and self._running_mode)
+              else self._game_mode_id())
+        payload = {
+            "ts": int(time.time()),
+            "running": bool(self._running),
+            "status": self.status_var.get(),
+            "mode": gm,
+            "activity": list(self._activity_lines),
+            "log": list(self._recent_log),
+            "version": config.VERSION,
+        }
+        try:
+            _remote_atomic_write_json(_REMOTE_STATUS_PATH, payload)
+        except OSError:
+            pass
+
+    def _remote_poll_command(self):
+        if not _REMOTE_CMD_PATH.exists():
+            return
+        try:
+            data = json.loads(_REMOTE_CMD_PATH.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            data = None
+        # Consume the file no matter what, so a malformed command cannot loop.
+        try:
+            _REMOTE_CMD_PATH.unlink()
+        except OSError:
+            pass
+        if isinstance(data, dict):
+            self._remote_execute(data.get("command"))
+
+    def _remote_execute(self, command):
+        """Run one allow-listed remote command (already signature-verified by
+        the companion; this is a second gate)."""
+        if command not in _REMOTE_ALLOWED_COMMANDS:
+            main.log(f"remote: ignored command {command!r}")
+            return
+        if command == "start":
+            main.log("remote: START received")
+            if not self._running:
+                self._start()
+        elif command == "stop":
+            main.log("remote: STOP received")
+            if self._running:
+                self._stop()
+        elif command == "sleep_phone":
+            main.log("remote: SLEEP PHONE received")
+            threading.Thread(target=self._remote_sleep_phone,
+                             daemon=True).start()
+        elif command == "close_emulator":
+            main.log("remote: CLOSE EMULATOR received")
+            threading.Thread(target=main.close_target, daemon=True).start()
+
+    def _remote_sleep_phone(self):
+        """Sleep the phone from a remote command. Runs off the tk thread, so it
+        builds its own ADB client from config (never touches tk vars)."""
+        try:
+            if main._active_adb is not None:
+                main._active_adb.sleep_phone()
+                return
+            serial = config.ADB_DEVICE
+            if not serial:
+                main.log("remote: sleep phone: no ADB device configured")
+                return
+            adb = ADBClient(adb_exe=find_adb(config.ADB_PATH))
+            adb.connect(serial)
+            adb.sleep_phone()
+        except (ADBError, RuntimeError, OSError) as e:
+            main.log(f"remote: sleep phone failed: {e}")
+
+    def _remote_status_text(self):
+        """(text, colour) for the companion status line, from its heartbeat."""
+        p = self.theme
+        if not config.REMOTE_ENABLED:
+            return t("remote.companion_off"), p["fg_muted"]
+        if (getattr(sys, "frozen", False)
+                and not (config.BASE_DIR / "A2 Remote.exe").exists()):
+            return t("remote.companion_missing"), p["bad"]
+        try:
+            hb = json.loads(_REMOTE_HEARTBEAT_PATH.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            hb = None
+        if not isinstance(hb, dict):
+            return t("remote.companion_starting"), p["fg_muted"]
+        now = time.time()
+        ts = hb.get("ts", 0)
+        if not isinstance(ts, (int, float)) or now - ts > 30:
+            return t("remote.companion_stopped"), p["warn"]
+        last_ok = hb.get("last_push_ok", 0)
+        if isinstance(last_ok, (int, float)) and last_ok > 0:
+            return (t("remote.companion_running", age=int(max(0, now - last_ok))),
+                    p["ok"])
+        return t("remote.companion_no_push"), p["fg_muted"]
+
+    def _render_remote_status(self):
+        lbl = self._remote_status_label
+        if lbl is None:
+            return
+        try:
+            if not lbl.winfo_exists():
+                self._remote_status_label = None
+                return
+            text, color = self._remote_status_text()
+            lbl.configure(text=text, fg=color)
+        except tk.TclError:
+            self._remote_status_label = None
+
+    # ------------------------------------------------------------------ language
+    @staticmethod
+    def _language_names():
+        return [name for _code, name in i18n.available_languages()]
+
+    @staticmethod
+    def _language_name(code):
+        for c, name in i18n.available_languages():
+            if c == code:
+                return name
+        return i18n.available_languages()[0][1]
+
+    def _language_code(self):
+        name = self.language_var.get()
+        for code, nm in i18n.available_languages():
+            if nm == name:
+                return code
+        return config.LANGUAGE
+
+    def _sp_build_language(self, parent):
+        """Display-language selector. The picked language persists immediately;
+        the visible UI is relabelled only on the next app start (no fragile
+        walk-every-widget relabel pass), so a restart hint sits below it."""
+        p = self.theme
+        outer = RoundedSection(
+            parent, title="", bg=p["surface"],
+            border_color=p["border"], radius=6, parent_bg=p["bg"])
+        outer.pack(fill="x", padx=8, pady=3)
+        inner = outer.inner
+
+        row = tk.Frame(inner, bg=p["surface"], highlightthickness=0)
+        row.pack(fill="x")
+        col = tk.Frame(row, bg=p["surface"], highlightthickness=0)
+        col.pack(side="left", fill="x", expand=True)
+        tk.Label(col, text=t("settings.group.language"),
+                 font=(ui_font(), 9, "bold"), fg=p["fg"],
+                 bg=p["surface"]).pack(anchor="w")
+        tk.Label(col, text=t("settings.group.language_sub"),
+                 font=(ui_font(), 8), fg=p["fg_muted"],
+                 bg=p["surface"]).pack(anchor="w")
+        combo = ttk.Combobox(row, textvariable=self.language_var,
+                             values=self._language_names(), state="readonly",
+                             width=12)
+        combo.pack(side="right")
+        combo.bind("<<ComboboxSelected>>", self._on_language_changed)
+        Tooltip(combo, t("settings.hint.language"))
+
+        tk.Label(inner, text=t("settings.language_restart_hint"),
+                 font=(ui_font(), 8), fg=p["warn"], bg=p["surface"],
+                 wraplength=420, justify="left").pack(anchor="w", pady=(4, 0))
+
+    def _on_language_changed(self, _event=None):
+        code = self._language_code()
+        i18n.set_language(code)
+        # Persist right away so the choice survives even with autosave off; it
+        # is also part of _collect_settings, so any later save keeps it.
+        config.apply_settings({"LANGUAGE": code})
+        config.save_settings()
+        main.log(f"display language set to {code}; restart to relabel the UI")
+
     def _sp_build_custom_buttons(self, parent):
         """Custom buttons accordion in the settings panel."""
         p = self.theme
@@ -3338,17 +4327,16 @@ class App:
                           cursor="hand2", highlightthickness=0)
         header.pack(fill="x")
 
-        icon_char, _ = self._SP_ICONS.get("Custom buttons", ("⊕", None))
-        tk.Label(header, text=icon_char, font=(ui_font(), 10),
+        tk.Label(header, text="⊕", font=(ui_font(), 10),
                  fg=p["accent"], bg=p["surface"], width=3,
                  cursor="hand2").pack(side="left", padx=(0, 4))
         title_f = tk.Frame(header, bg=p["surface"],
                            cursor="hand2", highlightthickness=0)
         title_f.pack(side="left", fill="x", expand=True)
-        tk.Label(title_f, text="Custom buttons",
+        tk.Label(title_f, text=t("custom_button.section_title"),
                  font=(ui_font(), 9, "bold"), fg=p["fg"],
                  bg=p["surface"], cursor="hand2").pack(anchor="w")
-        tk.Label(title_f, text="Press-it-when-you-see-it taps",
+        tk.Label(title_f, text=t("custom_button.section_subtitle"),
                  fg=p["fg_muted"], bg=p["surface"],
                  font=(ui_font(), 8),
                  cursor="hand2").pack(anchor="w")
@@ -3396,7 +4384,7 @@ class App:
 
         paths = sorted(config.REF_CUSTOM_DIR.glob("*.png"))
         if not paths:
-            ttk.Label(body, text="No custom buttons yet.",
+            ttk.Label(body, text=t("custom_button.none_yet"),
                       foreground="#888", font=("", 8, "italic")).pack(
                           anchor="w", pady=4)
         else:
@@ -3409,14 +4397,21 @@ class App:
 
         btn_row = ttk.Frame(body)
         btn_row.pack(fill="x", pady=(4, 2))
-        add_btn = ttk.Button(btn_row, text="+ Add button",
+        add_btn = ttk.Button(btn_row, text=t("custom_button.add"),
                               command=self._add_custom_button)
         add_btn.pack(side="left", expand=True, fill="x", padx=(0, 4))
         self._coord_buttons.append(add_btn)
-        ref_btn = ttk.Button(btn_row, text="Capture ref",
+        ref_btn = ttk.Button(btn_row, text=t("custom_button.capture_ref"),
                               command=self._recapture_ref)
         ref_btn.pack(side="left", expand=True, fill="x", padx=(4, 0))
         self._coord_buttons.append(ref_btn)
+
+        lang_row = ttk.Frame(body)
+        lang_row.pack(fill="x", pady=(2, 2))
+        lang_btn = ttk.Button(lang_row, text=t("ref_wizard.open_button"),
+                              command=self._recapture_language_refs)
+        lang_btn.pack(side="left", expand=True, fill="x")
+        self._coord_buttons.append(lang_btn)
 
     def _sp_build_ref_images(self, parent):
         """Reference images accordion in the settings panel."""
@@ -3430,17 +4425,16 @@ class App:
                           cursor="hand2", highlightthickness=0)
         header.pack(fill="x")
 
-        icon_char, _ = self._SP_ICONS.get("Reference images", ("⊞", None))
-        tk.Label(header, text=icon_char, font=(ui_font(), 10),
+        tk.Label(header, text="⊞", font=(ui_font(), 10),
                  fg=p["accent"], bg=p["surface"], width=3,
                  cursor="hand2").pack(side="left", padx=(0, 4))
         title_f = tk.Frame(header, bg=p["surface"],
                            cursor="hand2", highlightthickness=0)
         title_f.pack(side="left", fill="x", expand=True)
-        tk.Label(title_f, text="Reference images",
+        tk.Label(title_f, text=t("ref.section_title"),
                  font=(ui_font(), 9, "bold"), fg=p["fg"],
                  bg=p["surface"], cursor="hand2").pack(anchor="w")
-        tk.Label(title_f, text="Recapture built-in templates",
+        tk.Label(title_f, text=t("ref.section_subtitle"),
                  fg=p["fg_muted"], bg=p["surface"],
                  font=(ui_font(), 8),
                  cursor="hand2").pack(anchor="w")
@@ -3464,10 +4458,10 @@ class App:
                 row = tk.Frame(body, bg=p["surface"],
                                highlightthickness=0)
                 row.pack(fill="x", pady=2)
-                tk.Label(row, text="Built-in references",
+                tk.Label(row, text=t("ref.builtin_label"),
                          fg=p["fg_dim"], bg=p["surface"],
                          font=(ui_font(), 9)).pack(side="left")
-                btn = ttk.Button(row, text="Recapture",
+                btn = ttk.Button(row, text=t("ref.recapture_button"),
                                   command=self._recapture_ref)
                 btn.pack(side="right")
                 self._coord_buttons.append(btn)
@@ -3487,19 +4481,16 @@ class App:
                           cursor="hand2", highlightthickness=0)
         header.pack(fill="x")
 
-        icon_char, advanced = self._SP_ICONS.get("Movement tuning",
-                                                   ("↗", "advanced"))
-        icon_color = p["warn"] if advanced else p["accent"]
-        tk.Label(header, text=icon_char, font=(ui_font(), 10),
-                 fg=icon_color, bg=p["surface"], width=3,
+        tk.Label(header, text="↗", font=(ui_font(), 10),
+                 fg=p["warn"], bg=p["surface"], width=3,
                  cursor="hand2").pack(side="left", padx=(0, 4))
         title_f = tk.Frame(header, bg=p["surface"],
                            cursor="hand2", highlightthickness=0)
         title_f.pack(side="left", fill="x", expand=True)
-        tk.Label(title_f, text="Movement tuning",
+        tk.Label(title_f, text=t("settings.group.movement_tuning"),
                  font=(ui_font(), 9, "bold"), fg=p["fg"],
                  bg=p["surface"], cursor="hand2").pack(anchor="w")
-        tk.Label(title_f, text="Chapter, Plant & Custom vectors",
+        tk.Label(title_f, text=t("settings.group.movement_tuning_sub"),
                  fg=p["fg_muted"], bg=p["surface"],
                  font=(ui_font(), 8),
                  cursor="hand2").pack(anchor="w")
@@ -3517,57 +4508,52 @@ class App:
 
             ttk.Label(body, foreground="#888", wraplength=380, justify="left",
                       font=("", 8),
-                      text="Joystick starts bottom-centre; each vector swipes "
-                           "~10% of screen height at the angle, held for the "
-                           "duration. Set duration 0 to skip."
+                      text=t("movement.explanation")
                       ).pack(anchor="w", pady=(0, 6))
 
             # Chapter vectors
-            ttk.Label(body, text="Chapter movement",
+            ttk.Label(body, text=t("movement.chapter_movement"),
                       font=("", 9, "bold")).pack(anchor="w", pady=(4, 2))
             self._sp_mvmt_fields(body, "MOVEMENT_CHAPTER")
             ttk.Separator(body).pack(fill="x", pady=6)
 
             # Custom vectors
-            ttk.Label(body, text="Custom movement",
+            ttk.Label(body, text=t("movement.custom_movement"),
                       font=("", 9, "bold")).pack(anchor="w", pady=(4, 2))
             self._sp_mvmt_fields(body, "MOVEMENT_CUSTOM")
             ttk.Separator(body).pack(fill="x", pady=6)
 
             # Plant T-scale
-            ttk.Label(body, text="Plant Defense",
+            ttk.Label(body, text=t("movement.plant_defense"),
                       font=("", 9, "bold")).pack(anchor="w", pady=(4, 2))
             t_row = ttk.Frame(body)
             t_row.pack(fill="x", pady=2)
-            lbl = ttk.Label(t_row, text="T (time scale)")
+            lbl = ttk.Label(t_row, text=t("movement.time_scale"))
             lbl.pack(side="left")
-            Tooltip(lbl, "Seconds per unit. All Plant Defense durations are "
-                         "T-multiples, so adjusting T scales everything.")
+            Tooltip(lbl, t("movement.time_scale_tooltip"))
             cell = ttk.Frame(t_row)
             cell.pack(side="right")
-            ttk.Label(cell, text="s/unit", foreground="#888").pack(
-                side="right", padx=(4, 0))
+            ttk.Label(cell, text=t("movement.seconds_per_unit"),
+                      foreground="#888").pack(side="right", padx=(4, 0))
             ttk.Entry(cell, textvariable=self.movement_plant_t_var,
                       width=6).pack(side="left")
 
             # Test spawn + conduct
             spawn_row = ttk.Frame(body)
             spawn_row.pack(fill="x", pady=(6, 2))
-            slbl = ttk.Label(spawn_row, text="Test spawn:")
+            slbl = ttk.Label(spawn_row, text=t("movement.test_spawn"))
             slbl.pack(side="left")
-            Tooltip(slbl, "Spawn to simulate for Conduct Movement. In a real "
-                          "run the side comes from the Spawn Side toggle in "
-                          "the Plant Defense panel.")
-            for val, text in ((1, "1 Left"), (2, "2 Right")):
+            Tooltip(slbl, t("movement.test_spawn_tooltip"))
+            for val, text in ((1, t("movement.spawn_1_left")),
+                              (2, t("movement.spawn_2_right"))):
                 ttk.Radiobutton(spawn_row, text=text,
                                 variable=self.movement_plant_spawn_var,
                                 value=val).pack(side="left", padx=(6, 0))
             self._conduct_btn = ttk.Button(
-                body, text="Conduct Movement",
+                body, text=t("movement.conduct"),
                 command=self._conduct_plant_movement)
             self._conduct_btn.pack(anchor="w", pady=(4, 2))
-            Tooltip(self._conduct_btn,
-                    "Run movement for the selected test spawn immediately.")
+            Tooltip(self._conduct_btn, t("movement.conduct_tooltip"))
 
         def toggle(e=None):
             if body.winfo_ismapped():
@@ -3584,20 +4570,22 @@ class App:
     def _sp_mvmt_fields(self, parent, config_key):
         """Build Move 1 / Move 2 angle+duration rows in the settings panel."""
         vars_list = self.vars[config_key]
-        for i, label in enumerate(("Move 1", "Move 2")):
+        for i, label in enumerate((t("movement.move_1"), t("movement.move_2"))):
             row = ttk.Frame(parent)
             row.pack(fill="x", pady=2)
             ttk.Label(row, text=label).pack(side="left", padx=(8, 8))
-            ttk.Label(row, text="Angle", foreground="#888").pack(side="left")
+            ttk.Label(row, text=t("movement.angle"),
+                      foreground="#888").pack(side="left")
             ttk.Entry(row, textvariable=vars_list[i * 2], width=6).pack(
                 side="left", padx=(4, 2))
-            ttk.Label(row, text="°", foreground="#888").pack(
+            ttk.Label(row, text=t("movement.degrees"), foreground="#888").pack(
                 side="left", padx=(0, 10))
-            ttk.Label(row, text="Duration", foreground="#888").pack(
-                side="left")
+            ttk.Label(row, text=t("movement.duration"),
+                      foreground="#888").pack(side="left")
             ttk.Entry(row, textvariable=vars_list[i * 2 + 1], width=6).pack(
                 side="left", padx=(4, 2))
-            ttk.Label(row, text="s", foreground="#888").pack(side="left")
+            ttk.Label(row, text=t("movement.seconds"),
+                      foreground="#888").pack(side="left")
 
     # ------------------------------------------------------------------ settings load/save
     def _load_settings_into_form(self):
@@ -3650,6 +4638,14 @@ class App:
                 box.set(_fmt(seq[i]) if i < len(seq) else "")
         self.movement_plant_t_var.set(_fmt(config.MOVEMENT_PLANT_T))
 
+        # Remote settings
+        self.remote_enabled_var.set(bool(config.REMOTE_ENABLED))
+        self.remote_relay_var.set(config.REMOTE_RELAY_URL)
+        self.remote_pages_var.set(config.REMOTE_PAGES_URL)
+
+        # Display language
+        self.language_var.set(self._language_name(config.LANGUAGE))
+
         self._update_game_mode_disclosure()
 
     def _collect_settings(self, quiet=False):
@@ -3675,8 +4671,8 @@ class App:
         except ValueError:
             if not quiet:
                 messagebox.showerror(
-                    "Invalid setting",
-                    f"Could not read a number for '{label}'. Please check it.")
+                    t("settings.invalid_setting_title"),
+                    t("settings.invalid_setting_body", field=label))
             return None
 
         out["ACTIVE_CATEGORIES"] = list(self.active)
@@ -3687,8 +4683,20 @@ class App:
         out["KEEP_AWAKE"] = bool(self.keep_awake_var.get())
         out["HOTKEY"] = config.HOTKEY
 
-        # Game mode -> config keys
-        gm = self._game_mode_id()
+        # Remote status/control (companion reads these from settings.json).
+        out["REMOTE_ENABLED"] = bool(self.remote_enabled_var.get())
+        out["REMOTE_RELAY_URL"] = self.remote_relay_var.get().strip()
+        out["REMOTE_PAGES_URL"] = self.remote_pages_var.get().strip()
+
+        out["LANGUAGE"] = self._language_code()
+
+        # Game mode -> config keys. While running, a mode change picked in
+        # the GUI is only "pending" (see _on_game_mode_changed): the running
+        # macro must keep seeing the mode it was started with, so settings
+        # derived from the mode selector are pinned to _running_mode until
+        # the pending change is actually applied (on Stop or next Start).
+        gm = self._running_mode if (self._running and self._running_mode
+                                     is not None) else self._game_mode_id()
         out["GAME_MODE"] = gm
         out["ETERNAL_LODE_MODE"] = (gm == "eternal")
         out["EL_FAST_MODE"] = bool(self._el_fast_var.get())
@@ -3724,8 +4732,8 @@ class App:
         except ValueError:
             if not quiet:
                 messagebox.showerror(
-                    "Invalid setting",
-                    "Could not read a number for a Movement field.")
+                    t("settings.invalid_setting_title"),
+                    t("settings.invalid_movement_body"))
             return None
         return out
 
@@ -3739,20 +4747,18 @@ class App:
 
     def _save(self):
         if self._apply_and_save():
-            main.log("settings saved to settings.json")
+            main.log(t("log.settings_saved"))
 
     # autosave
     def _on_autosave_toggle(self):
         on = self.autosave_var.get()
-        main.log("autosave on, settings save after every change"
-                 if on else "autosave off")
+        main.log(t("log.autosave_on") if on else t("log.autosave_off"))
         self._apply_and_save(quiet=True)
 
     def _on_keep_awake_toggle(self):
         on = self.keep_awake_var.get()
         _set_keep_awake(on)
-        main.log("keep awake on, PC will not sleep or dim"
-                 if on else "keep awake off")
+        main.log(t("log.keep_awake_on") if on else t("log.keep_awake_off"))
         self._apply_and_save(quiet=True)
 
     # hotkey
@@ -3786,7 +4792,7 @@ class App:
 
         p = self.theme
         win = tk.Toplevel(self.root)
-        win.title("Set Hotkey")
+        win.title(t("hotkey.dialog_title"))
         win.geometry("320x200")
         win.transient(self.root)
         win.grab_set()
@@ -3794,10 +4800,10 @@ class App:
         win.configure(background=p["bg"])
         set_dark_titlebar(win, self.dark)
 
-        tk.Label(win, text="Set Start / Stop Hotkey",
+        tk.Label(win, text=t("hotkey.heading"),
                  font=(ui_font(), 11, "bold"),
                  fg=p["fg"], bg=p["bg"]).pack(pady=(16, 4))
-        tk.Label(win, text="Click here first, then press a new key combination:",
+        tk.Label(win, text=t("hotkey.instructions"),
                  fg=p["fg_dim"], bg=p["bg"],
                  font=(ui_font(), 9)).pack(pady=(8, 4))
 
@@ -3839,31 +4845,30 @@ class App:
         def _apply():
             combo = captured[0] if captured[0] is not None else config.HOTKEY
             config.HOTKEY = combo
-            self._hotkey_tip.text = (
-                f"Start / Stop hotkey: {_hotkey_display(combo)}. "
-                f"Click to change.")
+            self._hotkey_tip.text = t("controls.hotkey_tooltip",
+                                      hotkey=_hotkey_display(combo))
             self._start_hotkey_watcher()
             self._schedule_autosave()
-            main.log(f"hotkey set to {_hotkey_display(combo)}")
+            main.log(t("log.hotkey_set", hotkey=_hotkey_display(combo)))
             win.destroy()
 
         def _reset():
             captured[0] = "ctrl+`"
             display_var.set(_hotkey_display("ctrl+`"))
 
-        tk.Button(btn_row, text="Reset", command=_reset,
+        tk.Button(btn_row, text=t("hotkey.reset"), command=_reset,
                   font=(ui_font(), 9), relief="flat", cursor="hand2",
                   bg=p["surface_2"], fg=p["fg_dim"],
                   activebackground=p["surface_3"],
                   activeforeground=p["fg"], padx=8, pady=4).pack(side="left")
 
-        tk.Button(btn_row, text="Cancel", command=_close,
+        tk.Button(btn_row, text=t("hotkey.cancel"), command=_close,
                   font=(ui_font(), 9), relief="flat", cursor="hand2",
                   bg=p["surface_2"], fg=p["fg_dim"],
                   activebackground=p["surface_3"],
                   activeforeground=p["fg"], padx=8, pady=4).pack(side="right")
 
-        tk.Button(btn_row, text="Apply", command=_apply,
+        tk.Button(btn_row, text=t("hotkey.apply"), command=_apply,
                   font=(ui_font(), 9), relief="flat", cursor="hand2",
                   bg=p["accent"], fg="#ffffff",
                   activebackground=p["accent"],
@@ -3876,6 +4881,11 @@ class App:
         for var in self.vars.values():
             for v in (var if isinstance(var, list) else [var]):
                 v.trace_add("write", lambda *_: self._schedule_autosave())
+        # Remote URL fields live outside self.vars; autosave them too. The
+        # enable toggle is NOT traced here (it has side effects and persists
+        # explicitly in _on_remote_enabled_toggled).
+        for v in (self.remote_relay_var, self.remote_pages_var):
+            v.trace_add("write", lambda *_: self._schedule_autosave())
 
     def _schedule_autosave(self):
         if not self.autosave_var.get():
@@ -3912,14 +4922,19 @@ class App:
     def _start(self):
         if self._thread is not None and self._thread.is_alive():
             return
+        # A pending mode switch (should already have been applied when the
+        # previous run stopped) always wins over a stale running mode: apply
+        # it now, then capture whatever the selector shows as the mode this
+        # run uses, end of story.
+        if self._pending_mode is not None:
+            self._apply_pending_mode()
         gm = self._game_mode_id()
         if gm not in ("eternal", "allstar") and not self.active and not self.custom:
             if not messagebox.askyesno(
-                    "Nothing to pick",
-                    "No skill categories are active and no custom priority "
-                    "skills are set, so the macro will always take a skill "
-                    "slot.\n\nStart anyway?"):
+                    t("start.nothing_to_pick_title"),
+                    t("start.nothing_to_pick_body")):
                 return
+        self._running_mode = gm
         if not self._apply_and_save():
             return
 
@@ -3933,7 +4948,7 @@ class App:
         self._thread.start()
 
     def _run_thread(self):
-        gm = self._game_mode_id()
+        gm = self._running_mode
         if gm == "eternal":
             runner = eternal_lode.run_eternal_lode
         elif gm == "allstar":
@@ -3954,10 +4969,28 @@ class App:
         if self._stop_event is not None:
             self._stop_event.set()
         if self._running:
-            self.status_var.set("Stopping…")
+            self.status_var.set(t("status.stopping"))
+
+    def _apply_pending_mode(self):
+        """Apply a mode switch that was held pending while the macro ran:
+        clear the pending state/hint and auto-load that mode's saved skill
+        profile, if any (Feature B is deferred right alongside Feature A)."""
+        gm = self._pending_mode
+        self._pending_mode = None
+        self._update_pending_mode_hint()
+        if gm is not None:
+            self._apply_mode_skill_profile(gm)
+            # Persist the newly applied mode (and profile lists): without
+            # this, stopping and then closing the app would silently revert
+            # the mode pick on the next launch.
+            self._schedule_autosave()
 
     def _set_running(self, running):
         self._running = running
+        if not running:
+            if self._pending_mode is not None:
+                self._apply_pending_mode()
+            self._running_mode = None
         if running:
             self.start_btn.pack_forget()
             self.stop_btn.pack(side="left", before=self._status_pill)
@@ -3966,7 +4999,8 @@ class App:
             self.stop_btn.pack_forget()
             self.start_btn.pack(side="left", before=self._status_pill)
             self.start_btn.configure(state="normal")
-        self.status_var.set("Running" if running else "Stopped")
+        self.status_var.set(t("status.running") if running
+                            else t("status.stopped"))
         if running:
             self._start_status_pulse()
         else:
@@ -3986,8 +5020,7 @@ class App:
         if locked:
             self.root.update_idletasks()
             self._locked_geometry = self.root.geometry()
-        main.log("GUI locked, window pinned on top"
-                 if locked else "GUI unlocked")
+        main.log(t("log.gui_locked") if locked else t("log.gui_unlocked"))
 
     def _on_configure(self, event):
         if not self._locked or event.widget is not self.root:
@@ -4018,17 +5051,17 @@ class App:
         self._log_toggle_btn.bind("<Button-1>",
                                    lambda e: self._toggle_log())
 
-        tk.Label(bar, text="Log", font=(ui_font(), 10, "bold"),
+        tk.Label(bar, text=t("log.title"), font=(ui_font(), 10, "bold"),
                  fg=self.theme["fg"], bg=self.theme["surface"]
                  ).pack(side="left", padx=(6, 0))
 
         self._log_count_label = tk.Label(
-            bar, text="0 lines", font=(ui_font(), 8),
+            bar, text=t("log.lines", count=0), font=(ui_font(), 8),
             fg=self.theme["fg_muted"], bg=self.theme["surface"])
         self._log_count_label.pack(side="left", padx=(8, 0))
 
         self._log_clear_btn = tk.Label(
-            bar, text="Clear", font=(ui_font(), 9), cursor="hand2",
+            bar, text=t("log.clear"), font=(ui_font(), 9), cursor="hand2",
             fg=self.theme["fg_dim"], bg=self.theme["surface"])
         self._log_clear_btn.pack(side="right")
         self._log_clear_btn.bind("<Button-1>",
@@ -4080,12 +5113,14 @@ class App:
         self.log_text.delete("1.0", "end")
         self.log_text.config(state="disabled")
         self._log_line_count = 0
-        self._log_count_label.configure(text="0 lines")
+        self._log_count_label.configure(text=t("log.lines", count=0))
 
     def _drain_log(self):
         try:
             while True:
                 line = self._log_queue.get_nowait()
+                # Keep a rolling tail for the remote status file.
+                self._recent_log.append(line)
                 self.log_text.config(state="normal")
                 tag = self._log_line_tag(line)
                 # Insert timestamp portion with muted colour
@@ -4103,7 +5138,7 @@ class App:
                 self.log_text.config(state="disabled")
                 self._log_line_count += 1
                 self._log_count_label.configure(
-                    text=f"{self._log_line_count} lines")
+                    text=t("log.lines", count=self._log_line_count))
         except queue.Empty:
             pass
         self.root.after(120, self._drain_log)
@@ -4142,16 +5177,16 @@ class App:
             activebackground=self.theme["surface_3"],
             activeforeground=self.theme["fg"])
         self._compact_expand.pack(side="right", fill="y", padx=(8, 0))
-        Tooltip(self._compact_expand, "Back to the full window")
+        Tooltip(self._compact_expand, t("controls.back_to_full"))
         self._compact_start = tk.Button(
-            btn_row, text="▶  Start", command=self._start,
+            btn_row, text="▶  " + t("controls.start"), command=self._start,
             font=(ui_font(), 12, "bold"), foreground="#ffffff",
             background=self.theme["ok"], activebackground=self.theme["ok"],
             activeforeground="#ffffff", relief="flat", cursor="hand2",
             bd=0, highlightthickness=0, height=2)
         self._compact_start.pack(side="left", fill="both", expand=True)
         self._compact_stop = tk.Button(
-            btn_row, text="■  Stop", command=self._stop,
+            btn_row, text="■  " + t("controls.stop"), command=self._stop,
             font=(ui_font(), 12, "bold"), foreground="#ffffff",
             background=self.theme["bad"], activebackground=self.theme["bad"],
             activeforeground="#ffffff", relief="flat", cursor="hand2",
@@ -4166,7 +5201,7 @@ class App:
         self._compact_gm.pack(side="left", fill="x", expand=True)
         self._compact_gm.bind("<<ComboboxSelected>>",
                                self._on_game_mode_changed)
-        ttk.Label(row2, text="hrs",
+        ttk.Label(row2, text=t("timeout.hrs"),
                   foreground=self.theme.get("fg_muted", "#888")).pack(
             side="right", padx=(4, 0))
         ttk.Entry(row2, textvariable=self.vars["RUN_TIMEOUT_HOURS"][0],
@@ -4232,7 +5267,8 @@ class App:
         status text), e.g. 'A2 Macro · Running' / '· Stopped'."""
         if self._compact:
             try:
-                self.root.title(f"A2 Macro · {self.status_var.get()}")
+                self.root.title(t("app.title_compact",
+                                  status=self.status_var.get()))
             except tk.TclError:
                 pass
 
@@ -4260,9 +5296,13 @@ class App:
             self._stop_event.set()
         _set_keep_awake(False)
         self._stop_capture_stream()
+        # Stop the remote IPC loop and terminate the companion process.
+        self._remote_stop_ipc()
+        self._remote_stop_companion()
         if self._hotkey_watcher is not None:
             self._hotkey_watcher.stop()
         main.set_log_sink(None)
+        main.set_activity_sink(None)
         self.root.destroy()
 
 
@@ -4288,10 +5328,10 @@ class _Splash:
 
         frame = tk.Frame(win, background=theme["surface"], highlightthickness=0)
         frame.pack(fill="both", expand=True, padx=1, pady=1)
-        tk.Label(frame, text="A2 Macro Controller",
+        tk.Label(frame, text=t("splash.title"),
                  font=(ui_font(), 15, "bold"),
                  fg=theme["fg"], bg=theme["surface"]).pack(pady=(38, 4))
-        self._msg = tk.Label(frame, text="Loading…", font=(ui_font(), 9),
+        self._msg = tk.Label(frame, text=t("app.loading"), font=(ui_font(), 9),
                              fg=theme["fg_muted"], bg=theme["surface"])
         self._msg.pack()
         self._barw = w - 80
@@ -4322,7 +5362,7 @@ class _Splash:
 
 def main_gui():
     root = tk.Tk()
-    root.title(f"A2 Macro Controller v{config.VERSION}")
+    root.title(t("app.title", version=config.VERSION))
     root.geometry("1280x720")
     root.minsize(1180, 620)
     root.withdraw()                       # stay hidden until fully built

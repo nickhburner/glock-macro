@@ -26,6 +26,8 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
+import i18n
+from i18n import t
 from widgets import (
     ui_font, set_dark_titlebar, draw_rounded_rect,
     RoundedSection, RoundedButton,
@@ -45,9 +47,16 @@ VERSION_FILE  = BASE_DIR / "version.txt"
 SETTINGS_PATH = BASE_DIR / "settings.json"
 
 # User files the updater must NEVER overwrite (paths relative to the install
-# folder, forward slashes, lowercase).
-PRESERVED_FILES = ("settings.json", "ref/ref_zones.json")
-PRESERVED_DIRS  = ("ref/custom",)
+# folder, forward slashes, lowercase). remote_token.txt is the per-install
+# remote-control secret: it is never inside a release zip in the first place,
+# but keep it listed anyway (belt and braces) so no future zip layout can
+# ever clobber or replace it.
+PRESERVED_FILES = ("settings.json", "ref/ref_zones.json",
+                   "remote_token.txt")
+# ref/fr and ref/de hold the user's own localized ref captures (from the GUI
+# language ref wizard); like ref/custom they are per-install and must survive
+# an update, and they are not shipped in a release either.
+PRESERVED_DIRS  = ("ref/custom", "ref/fr", "ref/de")
 
 CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 
@@ -89,6 +98,17 @@ def dark_mode_enabled():
         return bool(data.get("DARK_MODE", True))
     except (OSError, ValueError):
         return True
+
+
+def language_setting():
+    """Read LANGUAGE from settings.json without importing config, same
+    approach as dark_mode_enabled() above. Falls back to i18n's default
+    (English) if the file is missing, invalid, or has no LANGUAGE key."""
+    try:
+        data = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+        return data.get("LANGUAGE", i18n.DEFAULT_LANGUAGE)
+    except (OSError, ValueError):
+        return i18n.DEFAULT_LANGUAGE
 
 
 def version_tuple(v):
@@ -272,7 +292,7 @@ class UpdaterApp:
         p = self.theme
         f = ui_font()
 
-        root.title("A2 Updater")
+        root.title(t("updater.window_title"))
         root.geometry("480x470")
         root.minsize(440, 430)
         root.configure(background=p["bg"])
@@ -291,13 +311,14 @@ class UpdaterApp:
                                 bg=p["bg"], fg=p["fg_muted"], font=(f, 10))
         self.ver_lbl.pack(side="left", padx=(8, 0), pady=(3, 0))
         self.check_btn = RoundedButton(
-            head, text="Check for Updates", command=self.on_check,
+            head, text=t("updater.check_for_updates"), command=self.on_check,
             bg=p["accent"], fg="#ffffff", font=(f, 9, "bold"), radius=6,
             padx=14, pady=5, canvas_bg=p["bg"])
         self.check_btn.pack(side="right")
 
         # Release info card
-        section = RoundedSection(root, title="Latest release", bg=p["surface"],
+        section = RoundedSection(root, title=t("updater.latest_release"),
+                                 bg=p["surface"],
                                  border_color=p["border"], title_fg=p["fg"],
                                  parent_bg=p["bg"])
         section.pack(fill="both", expand=True, padx=16, pady=(0, 10))
@@ -323,8 +344,7 @@ class UpdaterApp:
             highlightthickness=1, highlightbackground=p["border"],
             highlightcolor=p["border"])
         self.notes.pack(fill="both", expand=True)
-        self._set_notes("Press \"Check for Updates\" to look for a new "
-                        "version on GitHub.")
+        self._set_notes(t("updater.press_check_hint"))
 
         # Footer: progress + status + apply button
         foot = tk.Frame(root, bg=p["bg"])
@@ -333,12 +353,14 @@ class UpdaterApp:
         self.progress.pack(fill="x", pady=(0, 8))
         status_row = tk.Frame(foot, bg=p["bg"])
         status_row.pack(fill="x")
-        self.status_lbl = tk.Label(status_row, text="Ready.", bg=p["bg"],
+        self.status_lbl = tk.Label(status_row, text=t("updater.ready"),
+                                   bg=p["bg"],
                                    fg=p["fg_muted"], font=(f, 9),
                                    anchor="w", justify="left")
         self.status_lbl.pack(side="left", fill="x", expand=True)
         self.apply_btn = RoundedButton(
-            status_row, text="Download && Apply", command=self.on_apply,
+            status_row, text=t("updater.download_and_apply"),
+            command=self.on_apply,
             bg=p["ok"], fg="#ffffff", font=(f, 10, "bold"), radius=6,
             padx=18, pady=6, canvas_bg=p["bg"])
         self.apply_btn.pack(side="right")
@@ -374,7 +396,7 @@ class UpdaterApp:
             return
         self._set_busy(True)
         self.progress.set(0)
-        self.set_status("Checking GitHub for the latest release...")
+        self.set_status(t("updater.checking"))
         threading.Thread(target=self._check_worker, daemon=True).start()
 
     def _check_worker(self):
@@ -382,11 +404,11 @@ class UpdaterApp:
             info = check_for_update()
         except (urllib.error.URLError, OSError) as e:
             self._ui(self._check_failed,
-                     "Could not reach GitHub. Check your internet "
-                     f"connection and try again. ({e})")
+                     t("updater.check_failed_network", error=e))
             return
         except Exception as e:
-            self._ui(self._check_failed, f"Update check failed: {e}")
+            self._ui(self._check_failed,
+                     t("updater.check_failed_generic", error=e))
             return
         self._ui(self._check_done, info)
 
@@ -400,13 +422,14 @@ class UpdaterApp:
             self.release = info
             self.rel_version_lbl.configure(text=info["tag"])
             self.rel_size_lbl.configure(text=fmt_size(info["size"]))
-            self._set_notes(info["notes"] or "(no release notes)")
-            self.set_status(f"Update available: {info['tag']}", "ok")
+            self._set_notes(info["notes"] or t("updater.no_release_notes"))
+            self.set_status(t("updater.update_available", tag=info["tag"]),
+                            "ok")
         else:
             self.rel_version_lbl.configure(text=info["tag"] or "--")
             self.rel_size_lbl.configure(text="")
-            self._set_notes("You're up to date!")
-            self.set_status("You're up to date!", "ok")
+            self._set_notes(t("updater.up_to_date"))
+            self.set_status(t("updater.up_to_date"), "ok")
         self._set_busy(False)
 
     # ---- Download & apply
@@ -415,7 +438,7 @@ class UpdaterApp:
         if self.busy or self.release is None:
             return
         if is_main_app_running():
-            self.set_status(f"Close {APP_NAME} first, then try again.",
+            self.set_status(t("updater.close_app_first", app=APP_NAME),
                             "warn")
             return
         self._set_busy(True)
@@ -427,26 +450,26 @@ class UpdaterApp:
         tmp = Path(tempfile.mkdtemp(prefix="a2dl_"))
         zip_path = tmp / rel["name"]
         try:
-            self._ui(self.set_status, f"Downloading {rel['name']}...")
+            self._ui(self.set_status, t("updater.downloading", name=rel["name"]))
             try:
                 download_release(rel["url"], zip_path, rel["size"],
                                  self._dl_progress)
             except Exception:
                 # One quiet retry, then give up.
-                self._ui(self.set_status, "Download hiccup, retrying...",
+                self._ui(self.set_status, t("updater.download_hiccup"),
                          "warn")
                 download_release(rel["url"], zip_path, rel["size"],
                                  self._dl_progress)
 
-            self._ui(self.set_status, "Applying update...")
+            self._ui(self.set_status, t("updater.applying"))
             apply_update(zip_path, rel["tag"], self._copy_progress)
         except (urllib.error.URLError, OSError) as e:
             self._ui(self._apply_failed,
-                     f"Update failed: {e}. Nothing was changed that wasn't "
-                     "rolled back; try again later.")
+                     t("updater.update_failed_rolled_back", error=e))
             return
         except Exception as e:
-            self._ui(self._apply_failed, f"Update failed: {e}")
+            self._ui(self._apply_failed,
+                     t("updater.update_failed_generic", error=e))
             return
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
@@ -472,13 +495,12 @@ class UpdaterApp:
         self.progress.set(1.0)
         self._set_busy(False)
         self.apply_btn.configure(state="disabled")
-        self._set_notes("Update complete! Your settings, custom buttons, "
-                        "and match zones were preserved.\n\nYou can close "
-                        "this window and launch the app as usual.")
-        self.set_status(f"Updated to {tag}. You're good to go!", "ok")
+        self._set_notes(t("updater.update_complete_notes"))
+        self.set_status(t("updater.updated_to", tag=tag), "ok")
 
 
 def main():
+    i18n.set_language(language_setting())
     cleanup_old_self()
     root = tk.Tk()
     UpdaterApp(root)

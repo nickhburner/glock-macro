@@ -17,9 +17,11 @@ import cv2
 import numpy as np
 
 import config
+import fastinput
 from adb import ADBClient, ADBError, choose_server_port
 from main import (
     _interruptible_sleep,
+    activity,
     close_target,
     log,
     rand_delay,
@@ -63,22 +65,30 @@ class EternalLodeMacro:
     def __init__(self, adb_client: ADBClient):
         self.adb = adb_client
 
+        # Each template prefers its active-language variant (ref/<lang>/Eternal
+        # Lode/<name>.png) if the user captured one; else the bundled English
+        # ref. Most Eternal Lode cells are number/icon only (language-neutral),
+        # but set-max-buy ("Max") is text-bearing, so route them all through the
+        # resolver uniformly.
         self.cell_templates = []
         for name in _ALL_TYPES:
-            tpl = _load_optional(config.ETERNAL_LODE_DIR / f"{name}.png")
+            tpl = _load_optional(config.ref_path(
+                config.ETERNAL_LODE_DIR / f"{name}.png"))
             if tpl is not None:
                 self.cell_templates.append((name, tpl))
         log(f"Eternal Lode: loaded {len(self.cell_templates)} cell template(s)")
 
         self.resource_refs = {}
         for name in _RESOURCE_KEYS:
-            tpl = _load_optional(config.ETERNAL_LODE_DIR / f"{name}.png")
+            tpl = _load_optional(config.ref_path(
+                config.ETERNAL_LODE_DIR / f"{name}.png"))
             if tpl is not None:
                 self.resource_refs[name] = tpl
 
         self.ui_refs = {}
         for name in _UI_KEYS:
-            tpl = _load_optional(config.ETERNAL_LODE_DIR / f"{name}.png")
+            tpl = _load_optional(config.ref_path(
+                config.ETERNAL_LODE_DIR / f"{name}.png"))
             if tpl is not None:
                 self.ui_refs[name] = tpl
 
@@ -94,6 +104,31 @@ class EternalLodeMacro:
         self._ui_scales = None       # [scale_float, ...]
 
         self.buy_failed = False
+
+        # Low-latency tap injection (sendevent), wired up only when the user
+        # turns on ROOT_FAST_INPUT (run_eternal_lode calls setup_fast_tap once
+        # the resolution is known). Off / on-failure, _tap uses adb.tap as
+        # before. Independent of the All-Star FAST_TAP_ENABLED gate.
+        self._tapper = fastinput.FastTapper(adb_client)
+        self._fast_tap = False
+        self._fast_warned = False
+
+    def setup_fast_tap(self, width, height):
+        """Bring up the sendevent fast tapper for this run if ROOT_FAST_INPUT is
+        on; silent fallback to adb.tap on any failure."""
+        if not getattr(config, "ROOT_FAST_INPUT", False):
+            return
+        self._fast_tap = self._tapper.setup(
+            width, height, on_log=log,
+            enabled=True,
+            humanize=getattr(config, "HUMANIZED_TAPS", False))
+
+    def close(self):
+        """Release any held touch and tear down the fast tapper."""
+        try:
+            self._tapper.close()
+        except Exception:                              # noqa: BLE001
+            pass
 
     # ------------------------------------------------------------------
     # Geometry
@@ -312,6 +347,19 @@ class EternalLodeMacro:
         jy = y + random.randint(-config.CLICK_JITTER, config.CLICK_JITTER)
         log(f"  tap {label} @ ({jx}, {jy})")
         time.sleep(random.uniform(*config.CLICK_DELAY_RANGE))
+        # Fast tapper when ROOT_FAST_INPUT set one up; plain adb.tap otherwise or
+        # on a fast-path failure (the fallback is a plain tap, no humanization).
+        if self._fast_tap and self._tapper.available:
+            try:
+                self._tapper.tap(jx, jy)
+                if self._fast_warned:
+                    log("  fast-tap recovered")
+                    self._fast_warned = False
+                return
+            except fastinput.FastTapError as exc:
+                if not self._fast_warned:
+                    log(f"  fast-tap failed ({exc}); falling back to adb input tap")
+                    self._fast_warned = True
         self.adb.tap(jx, jy)
 
     def _cell_center(self, col, row_offset):
@@ -597,6 +645,7 @@ def run_eternal_lode(stop_event=None):
     if stop_event is None:
         stop_event = threading.Event()
 
+    activity.reset()            # clear any summary from a previous mode's run
     log("Eternal Lode mode")
 
     try:
@@ -614,8 +663,10 @@ def run_eternal_lode(stop_event=None):
     import main as _main
     _main._active_adb = adb_client
 
+    dev_wh = None
     try:
         w, h = adb_client.resolution()
+        dev_wh = (w, h)
         log(f"device: {adb_client.device}  resolution: {w}x{h}")
         config.PHONE_RESOLUTION = [w, h]
     except ADBError as e:
@@ -627,10 +678,18 @@ def run_eternal_lode(stop_event=None):
         log(f"FATAL: {e}")
         return
 
+    # Bring up the sendevent fast tapper if ROOT_FAST_INPUT is on (silent
+    # fallback to adb.tap otherwise or if the resolution is unknown).
+    if dev_wh is not None:
+        macro.setup_fast_tap(dev_wh[0], dev_wh[1])
+    elif getattr(config, "ROOT_FAST_INPUT", False):
+        log("root fast input: skipped (device resolution unknown); using adb input tap")
+
     log(f"ADB ready, starting in {config.STARTUP_DELAY:.0f}s")
     _interruptible_sleep(config.STARTUP_DELAY, stop_event)
     if stop_event.is_set():
         log("stopped before the run started")
+        macro.close()
         return
 
     timeout_hours = config.RUN_TIMEOUT_HOURS or 0
@@ -681,6 +740,8 @@ def run_eternal_lode(stop_event=None):
             _interruptible_sleep(rand_delay(config.POLL_INTERVAL), stop_event)
     except KeyboardInterrupt:
         log("stopped by user")
+
+    macro.close()
 
     if timed_out or self_stopped:
         if config.SLEEP_PHONE_ON_TIMEOUT:

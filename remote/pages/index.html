@@ -1,0 +1,581 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>A2 Remote</title>
+<style>
+  /* Palette mirrors the app's dark theme (gui.py _THEMES). */
+  :root {
+    --bg: #1a1b1f;
+    --surface: #212329;
+    --surface-2: #282b32;
+    --surface-3: #31343c;
+    --inset: #16171b;
+    --border: #33363e;
+    --border-strong: #41454e;
+    --fg: #f0f1f5;
+    --fg-dim: #a0a5b0;
+    --fg-muted: #717680;
+    --ok: #46b66e;
+    --bad: #e2575c;
+    --warn: #e0a534;
+    --accent: #5b86e8;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 16px 12px 40px;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+    font-size: 15px;
+  }
+  .wrap { max-width: 640px; margin: 0 auto; }
+  header {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    margin: 4px 2px 14px;
+  }
+  header h1 { font-size: 20px; margin: 0; }
+  header .install { color: var(--fg-muted); font-size: 12px; }
+  header .spacer { flex: 1; }
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px 16px;
+    margin-bottom: 12px;
+  }
+  .card h2 {
+    font-size: 12px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--fg-muted);
+    margin: 0 0 10px;
+  }
+  .statusline { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    background: var(--surface-3);
+    border: 1px solid var(--border-strong);
+    border-radius: 999px;
+    padding: 5px 14px 5px 11px;
+    font-weight: 600;
+  }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--fg-muted); }
+  .pill.running .dot { background: var(--ok); }
+  .pill.running { color: var(--ok); }
+  .pill.stopped .dot { background: var(--bad); }
+  .pill.stopped { color: var(--bad); }
+  .pill.offline .dot { background: var(--fg-muted); }
+  .pill.offline { color: var(--fg-muted); }
+  .meta { color: var(--fg-dim); font-size: 13px; }
+  .meta b { color: var(--fg); font-weight: 600; }
+  .age { color: var(--fg-muted); font-size: 12px; margin-top: 8px; }
+  .banner {
+    border-radius: 8px;
+    padding: 10px 12px;
+    font-size: 13px;
+    margin-bottom: 12px;
+    display: none;
+  }
+  .banner.show { display: block; }
+  .banner.warn { background: #3a3222; color: var(--warn); border: 1px solid #55482a; }
+  .banner.bad { background: #3a2426; color: var(--bad); border: 1px solid #57383b; }
+  .btnrow { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  button {
+    appearance: none;
+    border: 1px solid var(--border-strong);
+    border-radius: 8px;
+    background: var(--surface-2);
+    color: var(--fg);
+    font: inherit;
+    font-size: 14px;
+    font-weight: 600;
+    padding: 11px 8px;
+    cursor: pointer;
+  }
+  button:hover { background: var(--surface-3); }
+  button:disabled { opacity: 0.45; cursor: default; }
+  button.confirm { background: var(--warn); border-color: var(--warn); color: #1a1b1f; }
+  button.go { background: var(--ok); border-color: var(--ok); color: #ffffff; }
+  button.halt { background: var(--bad); border-color: var(--bad); color: #ffffff; }
+  button.linkish {
+    background: none;
+    border: none;
+    color: var(--fg-muted);
+    font-size: 12px;
+    font-weight: 400;
+    padding: 4px;
+    text-decoration: underline;
+  }
+  .feedback { font-size: 13px; color: var(--fg-dim); margin: 10px 2px 0; min-height: 18px; }
+  pre.log {
+    background: var(--inset);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 12px;
+    margin: 0;
+    font-family: Consolas, Menlo, monospace;
+    font-size: 12px;
+    line-height: 1.5;
+    color: var(--fg-dim);
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 45vh;
+    overflow-y: auto;
+  }
+  .notpaired { color: var(--fg-dim); font-size: 14px; line-height: 1.6; }
+  .notpaired code {
+    background: var(--inset);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 1px 5px;
+    font-size: 12px;
+  }
+  footer { color: var(--fg-muted); font-size: 11px; margin-top: 18px; text-align: center; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>A2 Remote</h1>
+    <span class="install" id="installShort"></span>
+    <span class="spacer"></span>
+    <button class="linkish" id="forgetBtn" style="display:none">Forget this device</button>
+  </header>
+
+  <div class="banner bad" id="errBanner"></div>
+  <div class="banner warn" id="warnBanner"></div>
+
+  <div id="pairedView" style="display:none">
+    <div class="card">
+      <h2>Status</h2>
+      <div class="statusline">
+        <span class="pill offline" id="runPill"><span class="dot"></span><span id="runText">Waiting...</span></span>
+        <span class="meta">Mode: <b id="modeText">-</b></span>
+        <span class="meta">App: <b id="verText">-</b></span>
+      </div>
+      <div class="meta" id="statusText" style="margin-top:10px">-</div>
+      <div class="age" id="ageText">no data yet</div>
+    </div>
+
+    <div class="card">
+      <h2>Activity</h2>
+      <pre class="log" id="activityBox">(no activity yet)</pre>
+    </div>
+
+    <div class="card">
+      <h2>Commands</h2>
+      <div class="btnrow">
+        <button class="go" data-cmd="start">Start macro</button>
+        <button class="halt" data-cmd="stop">Stop macro</button>
+        <button data-cmd="sleep_phone">Sleep phone</button>
+        <button data-cmd="close_emulator">Close BlueStacks / scrcpy</button>
+      </div>
+      <div class="feedback" id="cmdFeedback"></div>
+    </div>
+
+    <div class="card">
+      <h2>Log</h2>
+      <pre class="log" id="logBox">(no log yet)</pre>
+    </div>
+  </div>
+
+  <div id="notPairedView" class="card" style="display:none">
+    <h2>Not paired</h2>
+    <div class="notpaired">
+      This page is not paired with a PC yet.<br><br>
+      On the PC, open the A2 Macro Controller, enable the Remote panel and
+      press <code>Copy pairing link</code>, then open that link on this
+      device. The link carries the secret pairing key in the part after
+      <code>#</code>, which never leaves your browser.
+    </div>
+  </div>
+
+  <footer>
+    Status and commands are signed end to end with your pairing key.
+    The relay only stores the latest status for a few minutes and can
+    never control your PC.
+  </footer>
+</div>
+
+<script>
+"use strict";
+
+/* ------------------------------------------------------------------ *
+ * Canonical JSON, byte for byte identical to the Python side:
+ *   json.dumps(obj, sort_keys=True, separators=(",", ":"))
+ * with Python's default ensure_ascii=True. That means:
+ *   - object keys sorted (all protocol keys are ASCII, so JS sort()
+ *     and Python's sort agree),
+ *   - separators "," and ":" with no whitespace,
+ *   - '"' and '\' escaped, control chars as \b \t \n \f \r or \u00xx,
+ *   - EVERY character outside 0x20..0x7E escaped as \uxxxx (lowercase
+ *     hex, per UTF-16 code unit, so astral chars become surrogate
+ *     pairs exactly like CPython),
+ *   - numbers must be integers (floats format differently between the
+ *     two languages, so the protocol simply never uses them).
+ * The result is pure ASCII, so UTF-8 encoding it is trivial.
+ * ------------------------------------------------------------------ */
+function canonicalString(s) {
+  let out = '"';
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    const ch = s[i];
+    if (ch === '"') out += '\\"';
+    else if (ch === "\\") out += "\\\\";
+    else if (c === 8) out += "\\b";
+    else if (c === 9) out += "\\t";
+    else if (c === 10) out += "\\n";
+    else if (c === 12) out += "\\f";
+    else if (c === 13) out += "\\r";
+    else if (c < 0x20 || c > 0x7e) out += "\\u" + c.toString(16).padStart(4, "0");
+    else out += ch;
+  }
+  return out + '"';
+}
+
+function canonicalJson(v) {
+  if (v === null) return "null";
+  const t = typeof v;
+  if (t === "boolean") return v ? "true" : "false";
+  if (t === "number") {
+    if (!Number.isInteger(v)) throw new Error("only integers allowed in signed payloads");
+    return String(v);
+  }
+  if (t === "string") return canonicalString(v);
+  if (Array.isArray(v)) return "[" + v.map(canonicalJson).join(",") + "]";
+  if (t === "object") {
+    const keys = Object.keys(v).sort();
+    return "{" + keys.map(k => canonicalString(k) + ":" + canonicalJson(v[k])).join(",") + "}";
+  }
+  throw new Error("unsupported type in signed payload");
+}
+
+/* ------------------------------------------------------------------ crypto */
+const enc = new TextEncoder();
+
+function bufToHex(buf) {
+  return Array.from(new Uint8Array(buf))
+    .map(b => b.toString(16).padStart(2, "0")).join("");
+}
+
+async function sha256Hex(text) {
+  return bufToHex(await crypto.subtle.digest("SHA-256", enc.encode(text)));
+}
+
+async function hmacHex(token, message) {
+  const key = await crypto.subtle.importKey(
+    "raw", enc.encode(token), { name: "HMAC", hash: "SHA-256" },
+    false, ["sign"]);
+  return bufToHex(await crypto.subtle.sign("HMAC", key, enc.encode(message)));
+}
+
+function randHex16() {
+  const b = new Uint8Array(16);
+  crypto.getRandomValues(b);
+  return bufToHex(b.buffer);
+}
+
+/* ------------------------------------------------------------------ state */
+const STORE_KEY = "a2remote_pair";
+// The companion pushes status about once a minute while idle and speeds up
+// after a command, so the page polls slowly by default and only bursts fast
+// right after you send a command. It also stops entirely while the tab is
+// hidden, so a forgotten open tab costs the relay nothing.
+const POLL_MS = 15000;          // idle poll cadence (reads are cheap)
+const ACTIVE_POLL_MS = 4000;    // fast poll right after sending a command
+const ACTIVE_WINDOW_MS = 30000; // how long the fast burst lasts
+const STALE_SECONDS = 150;      // status older than this reads as offline
+const MODE_NAMES = {
+  chapter: "Chapter", eternal: "Eternal Lode", plant: "Plant Defense",
+  jungle: "Shackled Jungle", allstar: "All-Star Cup",
+};
+
+let pair = null;           // {i: install_id, k: token, r: relay url}
+let lastBlob = null;       // last VERIFIED status blob
+let polling = false;
+let activeUntil = 0;       // fast-poll until this timestamp (ms)
+let pollTimer = null;      // setTimeout handle for the poll loop
+
+const $ = id => document.getElementById(id);
+
+function showError(msg) {
+  const el = $("errBanner");
+  el.textContent = msg;
+  el.classList.add("show");
+}
+function clearError() { $("errBanner").classList.remove("show"); }
+function showWarn(msg) {
+  const el = $("warnBanner");
+  el.textContent = msg;
+  el.classList.add("show");
+}
+function clearWarn() { $("warnBanner").classList.remove("show"); }
+
+/* ------------------------------------------------------------------ pairing */
+function loadStoredPair() {
+  try {
+    const raw = localStorage.getItem(STORE_KEY);
+    if (!raw) return null;
+    const p = JSON.parse(raw);
+    if (p && /^[0-9a-f]{64}$/.test(p.i) && p.k && p.r) return p;
+  } catch (e) { /* fall through */ }
+  return null;
+}
+
+function parseHashPair() {
+  const h = location.hash;
+  if (!h || h.length < 2) return null;
+  const params = new URLSearchParams(h.slice(1));
+  const i = (params.get("i") || "").toLowerCase();
+  const k = params.get("k") || "";
+  let r = params.get("r") || "";
+  r = r.replace(/\/+$/, "");
+  const httpsOk = /^https:\/\//i.test(r)
+    || /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(r);
+  if (!/^[0-9a-f]{64}$/.test(i) || !k || !httpsOk) return null;
+  return { i: i, k: k, r: r };
+}
+
+async function init() {
+  if (!window.crypto || !crypto.subtle) {
+    showError("This page needs a secure (https) connection for WebCrypto.");
+    return;
+  }
+  const fromHash = parseHashPair();
+  if (fromHash) {
+    // Integrity check: the install id must be the SHA-256 of the token.
+    const want = await sha256Hex(fromHash.k);
+    if (want !== fromHash.i) {
+      showError("This pairing link is damaged (id does not match key). "
+        + "Copy a fresh link from the app.");
+    } else {
+      pair = fromHash;
+      try { localStorage.setItem(STORE_KEY, JSON.stringify(pair)); }
+      catch (e) { showWarn("Could not save the pairing in this browser; it will be forgotten when the tab closes."); }
+      // Drop the secret-bearing fragment from the address bar.
+      history.replaceState(null, "", location.pathname + location.search);
+    }
+  }
+  if (!pair) pair = loadStoredPair();
+
+  if (pair) {
+    $("pairedView").style.display = "";
+    $("notPairedView").style.display = "none";
+    $("forgetBtn").style.display = "";
+    $("installShort").textContent = "install " + pair.i.slice(0, 8);
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    kickPoll();
+    setInterval(renderAge, 1000);
+  } else {
+    $("pairedView").style.display = "none";
+    $("notPairedView").style.display = "";
+  }
+}
+
+/* Poll loop: slow by default, fast for a short window after a command, and
+ * paused entirely while the tab is hidden (so a backgrounded/forgotten tab
+ * makes zero requests). setTimeout (not setInterval) so the cadence can
+ * change between ticks and never overlaps a slow request. */
+function schedulePoll() {
+  if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+  if (document.hidden) return;
+  const interval = Date.now() < activeUntil ? ACTIVE_POLL_MS : POLL_MS;
+  pollTimer = setTimeout(() => { poll().then(schedulePoll); }, interval);
+}
+
+function kickPoll() {
+  if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+  poll().then(schedulePoll);
+}
+
+function onVisibilityChange() {
+  if (document.hidden) {
+    if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+  } else {
+    kickPoll();   // refresh immediately when the tab comes back
+  }
+}
+
+$("forgetBtn").addEventListener("click", () => {
+  if (!confirm("Forget this device? You will need the pairing link again.")) return;
+  try { localStorage.removeItem(STORE_KEY); } catch (e) { /* ignore */ }
+  location.reload();
+});
+
+/* ------------------------------------------------------------------ status */
+async function poll() {
+  if (!pair || polling) return;
+  polling = true;
+  try {
+    const resp = await fetch(pair.r + "/status?id=" + pair.i, { cache: "no-store" });
+    if (resp.status === 404) {
+      clearError();
+      renderOffline("No recent status on the relay. Is the companion running on the PC?");
+      return;
+    }
+    if (resp.status === 429) {
+      showWarn("The relay is rate limiting requests; retrying shortly.");
+      return;
+    }
+    if (!resp.ok) {
+      showWarn("Relay error (HTTP " + resp.status + ").");
+      return;
+    }
+    const data = await resp.json();
+    if (!data || typeof data.blob !== "object" || typeof data.sig !== "string") {
+      showWarn("Relay returned an unexpected response.");
+      return;
+    }
+    // Verify the signature BEFORE trusting anything in the blob.
+    const expect = await hmacHex(pair.k, canonicalJson(data.blob));
+    if (expect !== data.sig.toLowerCase()) {
+      showWarn("Received a status with a BAD signature; ignoring it. "
+        + "If this persists after regenerating the token, distrust the relay.");
+      return;
+    }
+    clearWarn();
+    clearError();
+    lastBlob = data.blob;
+    renderStatus();
+  } catch (e) {
+    showWarn("Cannot reach the relay (" + (e && e.message ? e.message : "network error") + ").");
+  } finally {
+    polling = false;
+  }
+}
+
+function renderOffline(reason) {
+  const pill = $("runPill");
+  pill.className = "pill offline";
+  $("runText").textContent = "Offline";
+  $("ageText").textContent = reason;
+}
+
+function renderStatus() {
+  if (!lastBlob) return;
+  const s = lastBlob.status || {};
+  const fresh = (Date.now() / 1000 - lastBlob.ts) <= STALE_SECONDS;
+  const pill = $("runPill");
+  if (!fresh) {
+    pill.className = "pill offline";
+    $("runText").textContent = "Offline";
+  } else if (s.running) {
+    pill.className = "pill running";
+    $("runText").textContent = "Running";
+  } else {
+    pill.className = "pill stopped";
+    $("runText").textContent = "Stopped";
+  }
+  $("modeText").textContent = MODE_NAMES[s.mode] || s.mode || "-";
+  $("verText").textContent = s.version ? "v" + s.version : "-";
+  $("statusText").textContent = s.status || "-";
+  renderPre($("activityBox"), Array.isArray(s.activity) ? s.activity : [],
+            "(no activity yet)");
+  renderPre($("logBox"), Array.isArray(s.log) ? s.log : [], "(log is empty)");
+  renderAge();
+}
+
+/* Fill a <pre> with lines, keeping the view pinned to the bottom if it was
+ * already scrolled there. */
+function renderPre(box, lines, emptyText) {
+  const atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 8;
+  box.textContent = lines.length ? lines.join("\n") : emptyText;
+  if (atBottom) box.scrollTop = box.scrollHeight;
+}
+
+function renderAge() {
+  if (!lastBlob) return;
+  const age = Math.max(0, Math.round(Date.now() / 1000 - lastBlob.ts));
+  let text;
+  if (age <= 2) text = "updated just now";
+  else if (age < 60) text = "updated " + age + "s ago";
+  else text = "updated " + Math.floor(age / 60) + "m " + (age % 60) + "s ago";
+  if (age > STALE_SECONDS) {
+    text += " (stale; the PC may be off or the companion stopped)";
+    $("runPill").className = "pill offline";
+    $("runText").textContent = "Offline";
+  }
+  $("ageText").textContent = text;
+}
+
+/* ------------------------------------------------------------------ commands */
+const CONFIRM_MS = 4000;
+let confirmTimer = null;
+
+document.querySelectorAll("button[data-cmd]").forEach(btn => {
+  btn.dataset.label = btn.textContent;
+  btn.addEventListener("click", () => onCmdClick(btn));
+});
+
+function resetConfirms() {
+  if (confirmTimer) { clearTimeout(confirmTimer); confirmTimer = null; }
+  document.querySelectorAll("button[data-cmd]").forEach(b => {
+    b.classList.remove("confirm");
+    b.textContent = b.dataset.label;
+  });
+}
+
+function onCmdClick(btn) {
+  if (!btn.classList.contains("confirm")) {
+    // First tap arms the button; second tap within 4 s sends.
+    resetConfirms();
+    btn.classList.add("confirm");
+    btn.textContent = "Tap again to confirm";
+    confirmTimer = setTimeout(resetConfirms, CONFIRM_MS);
+    return;
+  }
+  resetConfirms();
+  sendCommand(btn.dataset.cmd);
+}
+
+async function sendCommand(command) {
+  const fb = $("cmdFeedback");
+  const buttons = document.querySelectorAll("button[data-cmd]");
+  buttons.forEach(b => b.disabled = true);
+  fb.textContent = "Sending...";
+  try {
+    const blob = {
+      command: command,
+      nonce: randHex16(),
+      ts: Math.floor(Date.now() / 1000),
+    };
+    const sig = await hmacHex(pair.k, canonicalJson(blob));
+    const resp = await fetch(pair.r + "/cmd", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ install_id: pair.i, blob: blob, sig: sig }),
+    });
+    if (resp.ok) {
+      fb.textContent = "Command sent. The PC picks it up within a few "
+        + "seconds (only the newest pending command is kept).";
+      // Burst faster for a short while so the effect of the command shows up
+      // quickly, then fall back to the slow idle cadence.
+      activeUntil = Date.now() + ACTIVE_WINDOW_MS;
+      kickPoll();
+    } else if (resp.status === 429) {
+      fb.textContent = "Rate limited; wait a moment and try again.";
+    } else {
+      let msg = "HTTP " + resp.status;
+      try { const j = await resp.json(); if (j && j.error) msg = j.error; }
+      catch (e) { /* keep msg */ }
+      fb.textContent = "The relay rejected the command (" + msg + ").";
+    }
+  } catch (e) {
+    fb.textContent = "Could not reach the relay.";
+  } finally {
+    buttons.forEach(b => b.disabled = false);
+  }
+}
+
+init();
+</script>
+</body>
+</html>

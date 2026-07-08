@@ -1,0 +1,13 @@
+# Wrangler config for the A2 Remote relay worker.
+# See DEPLOY.md in this folder for the full step-by-step guide.
+
+name = "a2-remote-relay"
+main = "worker.js"
+compatibility_date = "2026-01-01"
+
+# The KV namespace the worker stores status blobs and pending commands in.
+# Create it with:  wrangler kv namespace create RELAY_KV
+# then paste the id that command prints in place of the placeholder below.
+[[kv_namespaces]]
+binding = "RELAY_KV"
+id = "3ebab2777feb450b85e00dcbdf264cff"

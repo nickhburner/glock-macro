@@ -23,6 +23,11 @@ settings.json
 # Per-machine custom button captures (user data, preserved by the updater)
 ref/custom/
 
+# Per-machine localized ref captures from the GUI language ref wizard
+# (user data, preserved by the updater, never shipped)
+ref/fr/
+ref/de/
+
 # Old release archives kept locally
 *.zip
 
@@ -33,3 +38,11 @@ ref/custom/
 
 # fastinput_check.py diagnostic output
 _fastcheck/
+
+# Remote-control runtime files (per-machine; remote_token.txt is a SECRET)
+remote_token.txt
+remote_status.json
+remote_cmd.json
+remote_heartbeat.json
+remote_agent.log
+remote_agent.log.1

@@ -40,7 +40,7 @@ import capture
 import config
 import fastinput
 from adb import ADBClient, ADBError, choose_server_port
-from main import _interruptible_sleep, log
+from main import _interruptible_sleep, activity, log
 from matcher import load_template, multi_scale_match
 
 # How long to sleep when the stream has not produced a new frame yet, so the
@@ -97,7 +97,9 @@ class AllStarMacro:
                     f"level-{level} bosses have no template in "
                     f"{config.ALL_STAR_BOSS_DIR.name}/ and cannot be "
                     f"identified: {', '.join(sorted(missing))}")
-        self._challenge = load_template(config.ALL_STAR_CHALLENGE)
+        # The Challenge button renders its label in the game language; prefer the
+        # active-language variant (ref/<lang>/all_star/challenge.png) if captured.
+        self._challenge = load_template(config.ref_path(config.ALL_STAR_CHALLENGE))
 
         # Bosses already shown in earlier sets this run (All-Star only: a boss
         # appears in at most one of a level's three sets, so anything
@@ -201,7 +203,13 @@ class AllStarMacro:
             f"y={cy}")
         if not self._tapper_ready:
             self._tapper_ready = True
-            self._tapper.setup(w, h, on_log=log)
+            # All-Star keeps its own FAST_TAP_ENABLED gate (unchanged by the new
+            # ROOT_FAST_INPUT master toggle, which only extends fast taps to the
+            # other modes).  Humanization is one global behavior, so All-Star
+            # honours HUMANIZED_TAPS too (it slows the mode down; user's call).
+            self._tapper.setup(w, h, on_log=log,
+                               enabled=getattr(config, "FAST_TAP_ENABLED", True),
+                               humanize=getattr(config, "HUMANIZED_TAPS", False))
 
     def _prep_candidates(self, names):
         """Pre-scale this set's candidate templates to (resolution factor *
@@ -607,6 +615,7 @@ def run_all_star(stop_event=None):
     if stop_event is None:
         stop_event = threading.Event()
 
+    activity.reset()            # clear any summary from a previous mode's run
     raw = getattr(config, "ALL_STAR_LEVEL", 1)
     if str(raw).strip().lower() == "elim":
         level = "elim"

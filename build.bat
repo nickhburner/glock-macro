@@ -37,16 +37,45 @@ python -m PyInstaller --noconfirm --onefile --windowed --name "A2 Updater" ^
 if errorlevel 1 goto fail
 
 echo.
+echo === Building the remote companion .exe ===
+rem Stdlib-only like the updater. The remote\ sources (worker + web page) are
+rem for the USER to deploy on their own accounts and are NOT copied into
+rem dist; the per-machine remote_token.txt / remote_status.json /
+rem remote_cmd.json files are created at runtime and must never ship either
+rem (nothing below copies them).
+python -m PyInstaller --noconfirm --onefile --windowed --name "A2 Remote" ^
+    remote_agent.py
+if errorlevel 1 goto fail
+
+echo.
 echo === Bundling image folders next to the .exe ===
 rem Wipe the copied folders first: xcopy never deletes, so refs removed from
 rem the repo would otherwise linger in dist/ and ship forever.
 if exist "dist\skills" rmdir /S /Q "dist\skills"
 if exist "dist\ref" rmdir /S /Q "dist\ref"
+if exist "dist\lang" rmdir /S /Q "dist\lang"
 xcopy /E /I /Y skills "dist\skills" >nul
 xcopy /E /I /Y ref "dist\ref" >nul
+xcopy /E /I /Y lang "dist\lang" >nul
 rem Custom button captures are per-machine user data: ship the folder empty.
 if exist "dist\ref\custom" rmdir /S /Q "dist\ref\custom"
 mkdir "dist\ref\custom"
+rem Localized ref captures (ref\fr, ref\de) are per-machine user data too (the
+rem user captures them via the GUI language ref wizard): never ship the
+rem captures, but ship the folders empty (like ref\custom) for consistency.
+if exist "dist\ref\fr" rmdir /S /Q "dist\ref\fr"
+if exist "dist\ref\de" rmdir /S /Q "dist\ref\de"
+mkdir "dist\ref\fr"
+mkdir "dist\ref\de"
+rem Remote-control runtime files are per-machine secrets/state. They are never
+rem copied here, but ALSO scrub any that running the app from dist\ left
+rem behind, so they can never end up inside a release zip.
+if exist "dist\remote_token.txt" del /Q "dist\remote_token.txt"
+if exist "dist\remote_status.json" del /Q "dist\remote_status.json"
+if exist "dist\remote_cmd.json" del /Q "dist\remote_cmd.json"
+if exist "dist\remote_heartbeat.json" del /Q "dist\remote_heartbeat.json"
+if exist "dist\remote_agent.log" del /Q "dist\remote_agent.log"
+if exist "dist\remote_agent.log.1" del /Q "dist\remote_agent.log.1"
 copy /Y version.txt "dist\version.txt" >nul
 if exist README.md copy /Y README.md "dist\README.md" >nul
 if exist settings.example.json copy /Y settings.example.json "dist\settings.json" >nul
